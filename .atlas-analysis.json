@@ -1,28 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "ABP Framework",
+  "projectType": "framework",
+  "projectName": "ABP Framework",
+  "projectDescription": "An opinionated open-source ASP.NET Core web application framework that provides modular architecture, DDD building blocks, multi-tenancy, authorization, and pre-built application modules for building enterprise .NET solutions.",
   "theme": "maple",
-  "colors": {
-    "primary": "#ba4395",
-    "light": "#ffffff",
-    "dark": "#ba4395"
-  },
-  "favicon": "https://media.brand.dev/861559e5-617f-43f0-a53d-ded6f1e1fc91.png",
-  "logo": {
-    "light": "https://media.brand.dev/2662d8ba-e84e-4dd7-a4d1-0228c7be0941.svg",
-    "dark": "https://media.brand.dev/2662d8ba-e84e-4dd7-a4d1-0228c7be0941.svg"
-  },
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/abpframework/abp"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/abpframework/abp"
-    }
-  },
+  "primaryColor": "#ba4395",
+  "lightColor": "#ffffff",
+  "darkColor": null,
   "navigation": {
     "tabs": [
       {
@@ -179,5 +162,43 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Modularity system with DependsOn-based dependency graph and lifecycle hooks (AbpModule, ModuleLoader)",
+    "DDD building blocks: Entity, AggregateRoot, IRepository, DomainService, ApplicationService, CrudAppService",
+    "Unit of Work pattern with transaction management and EF Core / MongoDB integration",
+    "Multi-tenancy with pluggable tenant resolvers and per-tenant connection strings",
+    "Authorization & Permission system with interceptor-based policy enforcement",
+    "Local and Distributed Event Bus with Outbox/Inbox pattern (RabbitMQ, Kafka, Azure, Dapr)",
+    "Background Jobs (Hangfire, Quartz, TickerQ) and Background Workers",
+    "Blob Storing abstraction with Azure, AWS, MinIO, FileSystem, GCP providers",
+    "Virtual File System for embedding static resources in NuGet packages",
+    "Localization system with JSON/virtual-file resource contributors",
+    "Settings and Feature Management with per-tenant, per-user, and edition-based value providers",
+    "Auto API Controllers converting Application Services to REST endpoints",
+    "Dynamic and Static C# HTTP Client Proxies for remote service calls",
+    "Blazor (Server / WebAssembly / MAUI) and Angular UI framework packages",
+    "ABP CLI with project scaffolding, module management, and proxy generation",
+    "Pre-built application modules: Identity, OpenIddict, Account, TenantManagement, AuditLogging, CmsKit, Blogging"
+  ],
+  "publicApiSurface": [
+    "AbpApplicationBase / AbpApplicationFactory (framework/src/Volo.Abp.Core/Volo/Abp/)",
+    "AbpModule / DependsOnAttribute (framework/src/Volo.Abp.Core/Volo/Abp/Modularity/)",
+    "Entity<TKey> / AggregateRoot<TKey> (framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Entities/)",
+    "IRepository<TEntity,TKey> / RepositoryBase (framework/src/Volo.Abp.Ddd.Domain/Volo/Abp/Domain/Repositories/)",
+    "CrudAppService<TEntity,TEntityDto,TKey> (framework/src/Volo.Abp.Ddd.Application/Volo/Abp/Application/Services/)",
+    "IUnitOfWorkManager / UnitOfWork (framework/src/Volo.Abp.Uow/Volo/Abp/Uow/)",
+    "IEventBus / ILocalEventBus / IDistributedEventBus (framework/src/Volo.Abp.EventBus.Abstractions/)",
+    "AbpDbContext<TDbContext> (framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/EntityFrameworkCore/)",
+    "AbpMongoDbContext (framework/src/Volo.Abp.MongoDB/Volo/Abp/MongoDB/)",
+    "ICurrentTenant / TenantResolver (framework/src/Volo.Abp.MultiTenancy/Volo/Abp/MultiTenancy/)",
+    "IPermissionChecker / AuthorizationInterceptor (framework/src/Volo.Abp.Authorization/)",
+    "IBlobContainer / BlobProviderBase (framework/src/Volo.Abp.BlobStoring/)",
+    "IBackgroundJobManager / BackgroundJobWorker (framework/src/Volo.Abp.BackgroundJobs/)",
+    "ISettingProvider / SettingDefinitionProvider (framework/src/Volo.Abp.Settings/)",
+    "IFeatureChecker / FeatureDefinitionProvider (framework/src/Volo.Abp.Features/)",
+    "AbpAspNetCoreMvcModule / AbpServiceConvention (framework/src/Volo.Abp.AspNetCore.Mvc/)",
+    "CliService / IConsoleCommand (framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/)",
+    "@abp/ng.core CoreModule (npm/ng-packs/packages/core/)"
+  ]
 }

@@ -1,0 +1,300 @@
+---
+title: "Data Filtering — ABP Framework"
+sidebarTitle: "Data Filtering"
+description: "How ABP's IDataFilter, DataFilter<TFilter>, and built-in ISoftDelete/IMultiTenant filters work, how providers apply them, and how to disable or define custom filters."
+---
+
+ABP's data filtering system provides a centralized, scoped way to enable or disable query-level filters across all data providers. Rather than sprinkling `where IsDeleted == false` clauses throughout repositories, you register a filter once and every repository that handles entities implementing the relevant marker interface honors it automatically.
+
+## Core Abstractions
+
+<CardGroup cols={2}>
+  <Card title="IDataFilter" icon="filter">
+    The top-level singleton service. Dispatches `Enable<T>()`, `Disable<T>()`, and `IsEnabled<T>()` calls to the per-type `IDataFilter<T>` instances cached in a `ConcurrentDictionary`.
+  </Card>
+  <Card title="IDataFilter&lt;TFilter&gt;" icon="toggle-on">
+    Per-type filter state. Uses `AsyncLocal<DataFilterState>` so that enabling/disabling a filter in one async flow does not affect sibling async flows.
+  </Card>
+  <Card title="AbpDataFilterOptions" icon="sliders">
+    Options class (`Dictionary<Type, DataFilterState>`) for setting the default enabled/disabled state of each filter at application startup.
+  </Card>
+  <Card title="DataFilterState" icon="circle-dot">
+    A simple mutable struct holding `bool IsEnabled`. Cloned from `AbpDataFilterOptions.DefaultStates` on first access per async context.
+  </Card>
+</CardGroup>
+
+## Implementation
+
+### `DataFilter` (singleton)
+
+```csharp
+public class DataFilter : IDataFilter, ISingletonDependency
+{
+    private readonly ConcurrentDictionary<Type, object> _filters;
+    private readonly IServiceProvider _serviceProvider;
+
+    public IDisposable Enable<TFilter>() where TFilter : class
+        => GetFilter<TFilter>().Enable();
+
+    public IDisposable Disable<TFilter>() where TFilter : class
+        => GetFilter<TFilter>().Disable();
+
+    public bool IsEnabled<TFilter>() where TFilter : class
+        => GetFilter<TFilter>().IsEnabled;
+
+    private IDataFilter<TFilter> GetFilter<TFilter>() where TFilter : class
+    {
+        return (_filters.GetOrAdd(
+            typeof(TFilter),
+            _ => _serviceProvider.GetRequiredService<IDataFilter<TFilter>>()
+        ) as IDataFilter<TFilter>)!;
+    }
+}
+```
+
+`GetOrAdd` ensures a single `IDataFilter<TFilter>` instance per type is cached in the dictionary. The per-type instance is resolved from DI (transient, but effectively cached here), which means it participates in the normal DI lifetime.
+
+### `DataFilter<TFilter>` (per-type, singleton-cached)
+
+```csharp
+public class DataFilter<TFilter> : IDataFilter<TFilter>
+    where TFilter : class
+{
+    private readonly AbpDataFilterOptions _options;
+    private readonly AsyncLocal<DataFilterState> _filter;
+
+    public bool IsEnabled
+    {
+        get
+        {
+            EnsureInitialized();
+            return _filter.Value!.IsEnabled;
+        }
+    }
+
+    public IDisposable Enable()
+    {
+        if (IsEnabled) return NullDisposable.Instance;
+        _filter.Value!.IsEnabled = true;
+        return new DisposeAction(() => Disable());
+    }
+
+    public IDisposable Disable()
+    {
+        if (!IsEnabled) return NullDisposable.Instance;
+        _filter.Value!.IsEnabled = false;
+        return new DisposeAction(() => Enable());
+    }
+
+    private void EnsureInitialized()
+    {
+        if (_filter.Value != null) return;
+        _filter.Value = _options.DefaultStates.GetOrDefault(typeof(TFilter))?.Clone()
+                        ?? new DataFilterState(true); // enabled by default
+    }
+}
+```
+
+Key design points:
+- `AsyncLocal<DataFilterState>` gives each async execution context its own copy of the filter state. A background job disabling soft-delete does not affect the web request running concurrently.
+- `EnsureInitialized` lazily copies the default state from `AbpDataFilterOptions.DefaultStates` on first access. If no default is registered, the filter starts **enabled**.
+- `Enable()` and `Disable()` return `IDisposable` that restores the previous state on disposal — use them with `using` blocks.
+
+## Built-in Filters
+
+### `ISoftDelete`
+
+Marks an entity as logically deleted rather than physically removed:
+
+```csharp
+public interface ISoftDelete
+{
+    bool IsDeleted { get; }
+}
+```
+
+When enabled (default), queries exclude rows where `IsDeleted == true`. `IRepository.DeleteAsync` sets `IsDeleted = true` and `DeletionTime`/`DeleterId` (if the entity also implements `IHasDeletionTime` / `IMustHaveDeletor`).
+
+### `IMultiTenant`
+
+```csharp
+public interface IMultiTenant
+{
+    Guid? TenantId { get; }
+}
+```
+
+When enabled (default), queries automatically restrict results to the current tenant's `TenantId`. The current tenant ID is read from `ICurrentTenant.Id`.
+
+## How EF Core Applies Filters
+
+During `OnModelCreating`, `AbpDbContext` calls `CreateFilterExpression<TEntity>` for every entity type that implements `ISoftDelete` or `IMultiTenant`, then registers the expression as an EF Core global query filter:
+
+```csharp
+// Soft-delete filter expression (standard path)
+Expression<Func<TEntity, bool>> softDeleteFilter =
+    e => !IsSoftDeleteFilterEnabled
+         || !EF.Property<bool>(e, softDeletePropertyName);
+
+// Multi-tenant filter expression
+Expression<Func<TEntity, bool>> multiTenantFilter =
+    e => !IsMultiTenantFilterEnabled
+         || EF.Property<Guid>(e, multiTenantPropertyName) == CurrentTenantId;
+
+// Applied as a HasQueryFilter
+entityTypeBuilder.HasQueryFilter(combinedExpression);
+```
+
+`IsSoftDeleteFilterEnabled` and `IsMultiTenantFilterEnabled` are `protected virtual bool` properties on `AbpDbContext` that forward to `DataFilter.IsEnabled<ISoftDelete>()`. Because these are instance properties (not captured values), EF Core re-evaluates them on every query without requiring a model rebuild.
+
+### DB-function path
+
+When `AbpEfCoreGlobalFilterOptions.UseDbFunction` is enabled, the filter expression is replaced with a call to a mapped SQL scalar function:
+
+```csharp
+expression = e => AbpEfCoreDataFilterDbFunctionMethods.SoftDeleteFilter(
+    ((ISoftDelete)e).IsDeleted, true);
+```
+
+This improves compiled-query cache efficiency because the lambda body no longer closes over the DbContext instance.
+
+## How MongoDB Applies Filters
+
+MongoDB has no model-level query filters. `MongoDbRepositoryFilterer<TEntity>` builds `FilterDefinition<TEntity>` objects at query time:
+
+```csharp
+public virtual Task AddGlobalFiltersAsync(List<FilterDefinition<TEntity>> filters)
+{
+    if (typeof(ISoftDelete).IsAssignableFrom(typeof(TEntity))
+        && DataFilter.IsEnabled<ISoftDelete>())
+    {
+        filters.Add(Builders<TEntity>.Filter.Eq(
+            e => ((ISoftDelete)e).IsDeleted, false));
+    }
+
+    if (typeof(IMultiTenant).IsAssignableFrom(typeof(TEntity)))
+    {
+        var tenantId = CurrentTenant.Id;
+        filters.Add(Builders<TEntity>.Filter.Eq(
+            e => ((IMultiTenant)e).TenantId, tenantId));
+    }
+
+    return Task.CompletedTask;
+}
+```
+
+The repository passes all accumulated `FilterDefinition` instances to `Builders<TEntity>.Filter.And(filters)` before executing the query.
+
+## Disabling Filters
+
+Use the `IDisposable` pattern so the filter is always restored:
+
+```csharp
+// Inject IDataFilter into your service
+public class AuditLogAppService : ApplicationService
+{
+    private readonly IRepository<AuditLog, Guid> _repository;
+    private readonly IDataFilter _dataFilter;
+
+    public async Task<List<AuditLog>> GetAllIncludingDeletedAsync()
+    {
+        using (_dataFilter.Disable<ISoftDelete>())
+        {
+            return await _repository.GetListAsync();
+        }
+    }
+}
+```
+
+<Warning>
+`Disable<TFilter>()` affects the **entire async context** for the duration of the `using` block. Any other repository or service called within that block will also see deleted records. Scope your `Disable` calls as narrowly as possible.
+</Warning>
+
+## Setting Default States
+
+Override the default enabled/disabled state in your module:
+
+```csharp
+Configure<AbpDataFilterOptions>(options =>
+{
+    // Disable multi-tenant filter by default
+    // (useful if your app is not multi-tenant)
+    options.DefaultStates[typeof(IMultiTenant)] = new DataFilterState(isEnabled: false);
+});
+```
+
+The `DefaultStates` dictionary is cloned per `AsyncLocal` context on first access, so changing defaults at startup does not affect already-initialized async contexts.
+
+## Defining Custom Filters
+
+<Steps>
+  <Step title="Declare a marker interface">
+    ```csharp
+    public interface IIsActive
+    {
+        bool IsActive { get; }
+    }
+    ```
+  </Step>
+  <Step title="Register the default state (optional)">
+    ```csharp
+    Configure<AbpDataFilterOptions>(options =>
+    {
+        options.DefaultStates[typeof(IIsActive)] = new DataFilterState(isEnabled: true);
+    });
+    ```
+  </Step>
+  <Step title="Apply in EF Core">
+    Override `CreateFilterExpression` in your `DbContext`:
+    ```csharp
+    protected override Expression<Func<TEntity, bool>>? CreateFilterExpression<TEntity>(
+        ModelBuilder modelBuilder,
+        EntityTypeBuilder<TEntity> entityTypeBuilder)
+    {
+        var expression = base.CreateFilterExpression<TEntity>(modelBuilder, entityTypeBuilder);
+
+        if (typeof(IIsActive).IsAssignableFrom(typeof(TEntity)))
+        {
+            Expression<Func<TEntity, bool>> isActiveFilter =
+                e => !IsEnabled<IIsActive>() || ((IIsActive)e).IsActive;
+
+            expression = expression == null
+                ? isActiveFilter
+                : QueryFilterExpressionHelper.CombineExpressions(expression, isActiveFilter);
+        }
+
+        return expression;
+    }
+
+    protected bool IsEnabled<TFilter>() where TFilter : class
+        => DataFilter?.IsEnabled<TFilter>() ?? false;
+    ```
+  </Step>
+  <Step title="Apply in MongoDB">
+    Create a custom filterer:
+    ```csharp
+    public class MyMongoDbRepositoryFilterer<TEntity>
+        : MongoDbRepositoryFilterer<TEntity>
+        where TEntity : class, IEntity
+    {
+        public override Task AddGlobalFiltersAsync(List<FilterDefinition<TEntity>> filters)
+        {
+            base.AddGlobalFiltersAsync(filters);
+
+            if (typeof(IIsActive).IsAssignableFrom(typeof(TEntity))
+                && DataFilter.IsEnabled<IIsActive>())
+            {
+                filters.Add(Builders<TEntity>.Filter.Eq(
+                    e => ((IIsActive)e).IsActive, true));
+            }
+
+            return Task.CompletedTask;
+        }
+    }
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+The `using (dataFilter.Enable<ISoftDelete>())` overload is useful in admin panels where soft-delete is globally disabled but you need to temporarily re-enable it to fetch the list of recoverable records.
+</Tip>

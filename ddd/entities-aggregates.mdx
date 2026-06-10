@@ -1,0 +1,370 @@
+---
+title: "Entities & Aggregate Roots in ABP Framework"
+sidebarTitle: "Entities & Aggregates"
+description: "Deep dive into ABP's Entity<TKey>, AggregateRoot<TKey>, domain events, extra properties, concurrency stamps, and the full auditing interface hierarchy."
+---
+
+The domain model in ABP Framework is built on a carefully layered set of base classes and interfaces. Every persistent object in the system descends from one of these types, and the choice of base class determines what infrastructure features — change tracking, domain events, extra property bags, optimistic concurrency, and auditing — the object participates in automatically.
+
+## Class hierarchy
+
+The diagram below shows the full inheritance chain from the raw `IEntity` interface down to the richest audited aggregate root you will typically use in a module.
+
+```mermaid
+classDiagram
+    direction TB
+
+    class IKeyedObject {
+        <<interface>>
+        +GetObjectKey() string?
+    }
+    class IEntity {
+        <<interface>>
+        +GetKeys() object?[]
+    }
+    class IEntity_TKey {
+        <<interface>>
+        +Id: TKey
+    }
+    class IAggregateRoot {
+        <<interface>>
+    }
+    class IAggregateRoot_TKey {
+        <<interface>>
+    }
+    class IGeneratesDomainEvents {
+        <<interface>>
+        +GetLocalEvents() IEnumerable~DomainEventRecord~
+        +GetDistributedEvents() IEnumerable~DomainEventRecord~
+        +ClearLocalEvents()
+        +ClearDistributedEvents()
+    }
+    class IHasExtraProperties {
+        <<interface>>
+        +ExtraProperties: ExtraPropertyDictionary
+    }
+    class IHasConcurrencyStamp {
+        <<interface>>
+        +ConcurrencyStamp: string
+    }
+
+    class Entity {
+        <<abstract>>
+        +GetKeys() object?[]
+        +EntityEquals(IEntity) bool
+    }
+    class Entity_TKey {
+        <<abstract>>
+        +Id: TKey
+    }
+    class BasicAggregateRoot {
+        <<abstract>>
+        -_localEvents
+        -_distributedEvents
+        +AddLocalEvent(object)
+        +AddDistributedEvent(object)
+    }
+    class BasicAggregateRoot_TKey {
+        <<abstract>>
+    }
+    class AggregateRoot {
+        <<abstract>>
+        +ExtraProperties: ExtraPropertyDictionary
+        +ConcurrencyStamp: string
+        +Validate(ValidationContext)
+    }
+    class AggregateRoot_TKey {
+        <<abstract>>
+    }
+    class CreationAuditedAggregateRoot_TKey {
+        <<abstract>>
+        +CreationTime: DateTime
+        +CreatorId: Guid?
+    }
+    class AuditedAggregateRoot_TKey {
+        <<abstract>>
+        +LastModificationTime: DateTime?
+        +LastModifierId: Guid?
+    }
+    class FullAuditedAggregateRoot_TKey {
+        <<abstract>>
+        +IsDeleted: bool
+        +DeleterId: Guid?
+        +DeletionTime: DateTime?
+    }
+
+    IKeyedObject <|-- IEntity
+    IEntity <|-- IEntity_TKey
+    IEntity <|-- IAggregateRoot
+    IEntity_TKey <|-- IAggregateRoot_TKey
+    IAggregateRoot <|-- IAggregateRoot_TKey
+
+    IEntity <|.. Entity
+    Entity <|-- Entity_TKey
+    IEntity_TKey <|.. Entity_TKey
+
+    Entity <|-- BasicAggregateRoot
+    IAggregateRoot <|.. BasicAggregateRoot
+    IGeneratesDomainEvents <|.. BasicAggregateRoot
+
+    Entity_TKey <|-- BasicAggregateRoot_TKey
+    IAggregateRoot_TKey <|.. BasicAggregateRoot_TKey
+    IGeneratesDomainEvents <|.. BasicAggregateRoot_TKey
+
+    BasicAggregateRoot <|-- AggregateRoot
+    IHasExtraProperties <|.. AggregateRoot
+    IHasConcurrencyStamp <|.. AggregateRoot
+
+    BasicAggregateRoot_TKey <|-- AggregateRoot_TKey
+    IHasExtraProperties <|.. AggregateRoot_TKey
+    IHasConcurrencyStamp <|.. AggregateRoot_TKey
+
+    AggregateRoot_TKey <|-- CreationAuditedAggregateRoot_TKey
+    CreationAuditedAggregateRoot_TKey <|-- AuditedAggregateRoot_TKey
+    AuditedAggregateRoot_TKey <|-- FullAuditedAggregateRoot_TKey
+```
+
+## `IEntity` and `Entity<TKey>`
+
+`IEntity` extends `IKeyedObject` and requires a single method:
+
+```csharp
+// Volo.Abp.Domain.Entities
+public interface IEntity : IKeyedObject
+{
+    object?[] GetKeys();
+}
+
+public interface IEntity<TKey> : IEntity
+{
+    TKey Id { get; }
+}
+```
+
+The abstract class `Entity` implements `IEntity` and wires up multi-tenancy bootstrapping in its constructor via `EntityHelper.TrySetTenantId(this)`. The typed variant `Entity<TKey>` adds the strongly-typed `Id` property and a single-element `GetKeys()` implementation:
+
+```csharp
+[Serializable]
+public abstract class Entity<TKey> : Entity, IEntity<TKey>
+{
+    public virtual TKey Id { get; protected set; } = default!;
+
+    protected Entity(TKey id)
+    {
+        Id = id;
+    }
+
+    public override object?[] GetKeys()
+    {
+        return [Id];
+    }
+
+    public override string ToString()
+    {
+        return $"[ENTITY: {GetType().Name}] Id = {Id}";
+    }
+}
+```
+
+<Note>
+Child objects that are **not** aggregate roots — for example, `IdentityUserClaim` which belongs to `IdentityUser` — should inherit from `Entity<TKey>` directly. They live inside the aggregate's transaction boundary and should not be accessed through their own repository.
+</Note>
+
+## `BasicAggregateRoot<TKey>` — domain events without extra properties
+
+`BasicAggregateRoot<TKey>` bridges `Entity<TKey>` and the `IGeneratesDomainEvents` contract. It maintains two private, lazily initialised collections of `DomainEventRecord` objects — one for in-process local events and one for distributed events:
+
+```csharp
+[Serializable]
+public abstract class BasicAggregateRoot<TKey> : Entity<TKey>,
+    IAggregateRoot<TKey>,
+    IGeneratesDomainEvents
+{
+    private ICollection<DomainEventRecord>? _distributedEvents;
+    private ICollection<DomainEventRecord>? _localEvents;
+
+    public virtual IEnumerable<DomainEventRecord> GetLocalEvents()
+        => _localEvents ?? Array.Empty<DomainEventRecord>();
+
+    public virtual IEnumerable<DomainEventRecord> GetDistributedEvents()
+        => _distributedEvents ?? Array.Empty<DomainEventRecord>();
+
+    protected virtual void AddLocalEvent(object eventData)
+    {
+        _localEvents ??= new Collection<DomainEventRecord>();
+        _localEvents.Add(new DomainEventRecord(eventData, EventOrderGenerator.GetNext()));
+    }
+
+    protected virtual void AddDistributedEvent(object eventData)
+    {
+        _distributedEvents ??= new Collection<DomainEventRecord>();
+        _distributedEvents.Add(new DomainEventRecord(eventData, EventOrderGenerator.GetNext()));
+    }
+}
+```
+
+<Tip>
+Use `BasicAggregateRoot<TKey>` when your aggregate root must **not** carry extra properties or a concurrency stamp — for example, a high-throughput log entry that should stay as thin as possible.
+</Tip>
+
+## `AggregateRoot<TKey>` — the standard base class
+
+`AggregateRoot<TKey>` inherits from `BasicAggregateRoot<TKey>` and adds two important cross-cutting concerns: an extensible property dictionary (`IHasExtraProperties`) and optimistic concurrency protection (`IHasConcurrencyStamp`).
+
+```csharp
+[Serializable]
+public abstract class AggregateRoot<TKey> : BasicAggregateRoot<TKey>,
+    IHasExtraProperties,
+    IHasConcurrencyStamp
+{
+    public virtual ExtraPropertyDictionary ExtraProperties { get; protected set; }
+
+    [DisableAuditing]
+    public virtual string ConcurrencyStamp { get; set; }
+
+    protected AggregateRoot()
+    {
+        ConcurrencyStamp = Guid.NewGuid().ToString("N");
+        ExtraProperties = new ExtraPropertyDictionary();
+        this.SetDefaultsForExtraProperties();
+    }
+
+    protected AggregateRoot(TKey id) : base(id)
+    {
+        ConcurrencyStamp = Guid.NewGuid().ToString("N");
+        ExtraProperties = new ExtraPropertyDictionary();
+        this.SetDefaultsForExtraProperties();
+    }
+
+    public virtual IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
+    {
+        return ExtensibleObjectValidator.GetValidationErrors(this, validationContext);
+    }
+}
+```
+
+### `IHasExtraProperties` — the extensible property bag
+
+`ExtraPropertyDictionary` is a `Dictionary<string, object?>` that is persisted as a JSON column (EF Core) or a sub-document field (MongoDB). It lets modules and application code add new fields to an entity **without changing its schema or recompiling** the defining assembly.
+
+```csharp
+// Adding an extra property inside an aggregate method
+user.SetProperty("Nickname", "jdoe");
+
+// Reading it back
+var nickname = user.GetProperty<string>("Nickname");
+```
+
+The `SetDefaultsForExtraProperties()` extension method (from `Volo.Abp.ObjectExtending`) iterates all `ObjectExtensionManager`-registered properties for the type and populates their default values at construction time.
+
+### `IHasConcurrencyStamp`
+
+The `ConcurrencyStamp` is a random 32-char hex string (a `Guid` formatted with `"N"`) set in the constructor. Both the EF Core and MongoDB providers enforce optimistic concurrency by comparing this stamp on every update, preventing lost-update anomalies when two requests modify the same aggregate concurrently.
+
+<Warning>
+Do **not** set `ConcurrencyStamp` manually. The repository provider updates it automatically before each `UpdateAsync` call.
+</Warning>
+
+## Domain events
+
+Domain events are plain POCO objects enqueued inside an aggregate by calling `AddLocalEvent` or `AddDistributedEvent`. The Unit of Work infrastructure harvests them after `SaveChangesAsync` succeeds.
+
+```csharp
+public class DomainEventRecord
+{
+    public object EventData { get; }
+    public long EventOrder { get; }
+
+    public DomainEventRecord(object eventData, long eventOrder)
+    {
+        EventData = eventData;
+        EventOrder = eventOrder;
+    }
+}
+```
+
+`EventOrder` comes from `EventOrderGenerator.GetNext()` — a monotonically increasing `long` that preserves cross-aggregate ordering within a single Unit of Work.
+
+After the Unit of Work commits, the `EntityChangeEventHelper` collects all `DomainEventEntry` objects (wrapping the source entity, event data, and order) into an `EntityEventReport` and dispatches them through the in-process event bus. Distributed events are forwarded to the configured message broker.
+
+```mermaid
+sequenceDiagram
+    participant A as Aggregate
+    participant UoW as Unit of Work
+    participant EF as EF Core / MongoDB
+    participant Bus as Event Bus
+
+    A->>A: AddLocalEvent(eventData)
+    A->>A: AddDistributedEvent(eventData)
+    UoW->>EF: SaveChangesAsync()
+    EF-->>UoW: committed
+    UoW->>Bus: Publish local DomainEvents
+    UoW->>Bus: Publish distributed Events
+```
+
+## Auditing base classes
+
+ABP provides a stack of convenience aggregate root base classes that automatically record who created, modified, or deleted an entity. These are all defined in `Volo.Abp.Domain.Entities.Auditing`.
+
+<CardGroup cols={2}>
+  <Card title="CreationAuditedAggregateRoot&lt;TKey&gt;" icon="circle-plus">
+    Adds `CreationTime` (`DateTime`) and `CreatorId` (`Guid?`). Populated automatically by the `CreationAuditedEntityInterceptor`.
+  </Card>
+  <Card title="AuditedAggregateRoot&lt;TKey&gt;" icon="pen-to-square">
+    Extends creation auditing with `LastModificationTime` (`DateTime?`) and `LastModifierId` (`Guid?`).
+  </Card>
+  <Card title="FullAuditedAggregateRoot&lt;TKey&gt;" icon="trash">
+    Adds soft-delete support: `IsDeleted` (`bool`), `DeleterId` (`Guid?`), and `DeletionTime` (`DateTime?`). The repository's `ApplyDataFilters` method automatically filters out soft-deleted records.
+  </Card>
+  <Card title="WithUser variants" icon="user">
+    `CreationAuditedAggregateRootWithUser<TKey, TUser>`, `AuditedAggregateRootWithUser`, and `FullAuditedAggregateRootWithUser` store a navigation property to the actual user entity rather than just the ID.
+  </Card>
+</CardGroup>
+
+### `ISoftDelete`
+
+`FullAuditedAggregateRoot<TKey>` implements `IFullAuditedObject` which in turn implements `ISoftDelete`. When the `ISoftDelete` data filter is enabled (the default), `RepositoryBase.ApplyDataFilters` appends a `WHERE IsDeleted = false` clause to every query:
+
+```csharp
+protected virtual TQueryable ApplyDataFilters<TQueryable>(TQueryable query)
+    where TQueryable : IQueryable<TEntity>
+{
+    if (typeof(ISoftDelete).IsAssignableFrom(typeof(TEntity)))
+    {
+        query = (TQueryable)query.WhereIf(
+            DataFilter.IsEnabled<ISoftDelete>(),
+            e => ((ISoftDelete)e!).IsDeleted == false);
+    }
+    // ...
+    return query;
+}
+```
+
+## Choosing the right base class
+
+<Steps>
+  <Step title="Does it need to be an aggregate root?">
+    Child objects (e.g., order lines inside an order) should extend `Entity<TKey>`. They must not have their own repository and are only reachable through the parent aggregate.
+  </Step>
+  <Step title="Does it need extra properties / concurrency?">
+    If yes, use `AggregateRoot<TKey>`. This is the most common choice for any module entity that users may want to extend without modifying source code. If no, use `BasicAggregateRoot<TKey>` for a leaner footprint.
+  </Step>
+  <Step title="Does it need auditing?">
+    Choose the appropriate audited base class: `CreationAuditedAggregateRoot<TKey>` → `AuditedAggregateRoot<TKey>` → `FullAuditedAggregateRoot<TKey>` depending on how much audit trail the aggregate requires.
+  </Step>
+</Steps>
+
+A real example from the Identity module:
+
+```csharp
+// modules/identity/src/Volo.Abp.Identity.Domain
+public class IdentityUser : FullAuditedAggregateRoot<Guid>, IUser, IHasEntityVersion
+{
+    public virtual Guid? TenantId { get; protected set; }
+    public virtual string UserName { get; protected internal set; }
+    public virtual string Email { get; protected internal set; }
+    // ... child collections managed by the aggregate
+}
+```
+
+`IdentityUser` gets: `ExtraProperties`, `ConcurrencyStamp`, `CreationTime`, `CreatorId`, `LastModificationTime`, `LastModifierId`, `IsDeleted`, `DeleterId`, `DeletionTime`, and domain event infrastructure — all for free by picking the right base class.

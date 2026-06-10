@@ -1,0 +1,290 @@
+---
+title: "Blazor UI Components and Services Internals"
+sidebarTitle: "Blazor Components"
+description: "AbpBlazorMessageLocalizerHelper, IAbpUtilsService, AlertManager, AbpBlockUiService, BlazoriseUI components, MudBlazor integration, and Blazor exception handling."
+---
+
+ABP's Blazor component layer is built on two foundations: the `Volo.Abp.AspNetCore.Components.Web` package provides infrastructure services (messaging, block UI, alerts, JS interop utilities), while `Volo.Abp.BlazoriseUI` provides the concrete Razor component library built on top of Blazorise.
+
+## AbpBlazorMessageLocalizerHelper&lt;T&gt;
+
+This singleton helper bridges the gap between validation error messages (which arrive as raw string keys and argument lists) and the `IStringLocalizer<T>` API:
+
+```csharp
+public class AbpBlazorMessageLocalizerHelper<T>
+{
+    private readonly IStringLocalizer<T> stringLocalizer;
+
+    public string Localize(string message, IEnumerable<string>? arguments = null)
+    {
+        try
+        {
+            var argumentsList = arguments?.ToList();
+            return argumentsList?.Count > 0
+                ? stringLocalizer[message, LocalizeMessageArguments(argumentsList).ToArray()]
+                : stringLocalizer[message];
+        }
+        catch
+        {
+            return stringLocalizer[message];
+        }
+    }
+
+    private IEnumerable<object> LocalizeMessageArguments(List<string> arguments)
+    {
+        foreach (var argument in arguments)
+        {
+            // Try "DisplayName:{Name}" first (data annotation display names)
+            var localization = stringLocalizer[$"DisplayName:{argument}"];
+            if (localization.ResourceNotFound)
+                localization = stringLocalizer[argument];
+            yield return localization;
+        }
+    }
+}
+```
+
+The two-step argument resolution (`DisplayName:{Name}` → `{Name}`) ensures that field names in validation messages use their localized display names when available. For example, a `required` error on a `UserName` field would produce "The 'User Name' field is required." if `DisplayName:UserName` is defined in the resource.
+
+Registered as a singleton by `AbpBlazoriseUIModule`:
+```csharp
+context.Services.AddSingleton(typeof(AbpBlazorMessageLocalizerHelper<>));
+```
+
+## IAbpUtilsService
+
+A JSInterop bridge for DOM manipulation tasks that Blazor cannot do directly:
+
+```csharp
+public interface IAbpUtilsService
+{
+    ValueTask AddClassToTagAsync(string tagName, string className);
+    ValueTask RemoveClassFromTagAsync(string tagName, string className);
+    ValueTask<bool> HasClassOnTagAsync(string tagName, string className);
+    ValueTask ReplaceLinkHrefByIdAsync(string linkId, string hrefValue);
+    ValueTask ToggleFullscreenAsync();
+    ValueTask RequestFullscreenAsync();
+    ValueTask ExitFullscreenAsync();
+}
+```
+
+The implementation calls into `abp.utils.*` JavaScript functions from the ABP client-side library. Common uses:
+- `AddClassToTagAsync("body", "rtl")` — applied during WASM culture initialization for RTL languages
+- `ReplaceLinkHrefByIdAsync("AbpThemeStylesheet", newHref)` — used by theme switchers to hot-swap the CSS file without a page reload
+- `ToggleFullscreenAsync()` / `RequestFullscreenAsync()` — fullscreen mode for data grids or media viewers
+
+## Alert System
+
+### AlertManager
+
+```csharp
+public class AlertManager : IAlertManager, IScopedDependency
+{
+    public AlertList Alerts { get; }
+
+    public AlertManager()
+    {
+        Alerts = new AlertList();
+    }
+}
+```
+
+`AlertManager` is scoped (per Blazor circuit in Server mode, per-component-tree in WASM). Components inject `IAlertManager` and add alerts:
+
+```csharp
+@inject IAlertManager AlertManager
+
+// Add a success alert
+AlertManager.Alerts.Add(new AlertMessage(AlertType.Success, "Record saved successfully."));
+```
+
+The `PageAlert` component in `Volo.Abp.BlazoriseUI` subscribes to `AlertManager` and renders alerts in the page layout. Alerts are cleared on navigation.
+
+## Block UI Service
+
+```csharp
+public class AbpBlockUiService : IBlockUiService, IScopedDependency
+{
+    public IJSRuntime JsRuntime { get; }
+
+    public async Task Block(string? selectors, bool busy = false)
+    {
+        await JsRuntime.InvokeVoidAsync("abp.ui.block", selectors, busy);
+    }
+
+    public async Task UnBlock()
+    {
+        await JsRuntime.InvokeVoidAsync("abp.ui.unblock");
+    }
+}
+```
+
+`AbpBlockUiService` calls `abp.ui.block(selectors, busy)` and `abp.ui.unblock()` via JSInterop, which show/hide a loading overlay on the page or a specific element. The `busy` flag controls whether a spinner is shown inside the blocked area.
+
+Typical usage in a CRUD page:
+
+```csharp
+await BlockUiService.Block(selectors: null, busy: true);
+try
+{
+    await MyAppService.DeleteAsync(id);
+}
+finally
+{
+    await BlockUiService.UnBlock();
+}
+```
+
+## AbpBlazoriseUIModule
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreComponentsWebModule),
+    typeof(AbpDddApplicationContractsModule),
+    typeof(AbpAuthorizationModule),
+    typeof(AbpGlobalFeaturesModule),
+    typeof(AbpFeaturesModule)
+)]
+public class AbpBlazoriseUIModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddBlazorise(options =>
+        {
+            options.Debounce = true;
+            options.DebounceInterval = 800;
+        });
+
+        // Replace default component activator with Blazorise's DI-aware one
+        context.Services.Replace(
+            ServiceDescriptor.Scoped<IComponentActivator, ComponentActivator>());
+
+        context.Services.AddSingleton(typeof(AbpBlazorMessageLocalizerHelper<>));
+    }
+}
+```
+
+The 800ms debounce on Blazorise inputs prevents rapid re-validation and API calls while a user is typing. The custom `ComponentActivator` ensures Blazorise components (like `DataGrid`, `Modal`, etc.) are resolved from the DI container.
+
+## BlazoriseUI Components
+
+Components live in `Volo.Abp.BlazoriseUI/Components/`:
+
+<CardGroup cols={2}>
+  <Card title="AbpExtensibleDataGrid" icon="table">
+    A data grid that renders object extension properties as additional columns. Uses `AbpBlazoriseUiObjectExtensionPropertyInfoExtensions` to discover extra property metadata from `ObjectExtensions` in the application configuration.
+  </Card>
+  <Card title="EntityActions / EntityAction" icon="ellipsis">
+    Renders a dropdown of actions for a data grid row. Each `EntityAction` evaluates `RequiredPolicy`, `Visible` predicate, and `Enabled` predicate before rendering. Actions support both synchronous and async click handlers.
+  </Card>
+  <Card title="UiMessageAlert / UiNotificationAlert" icon="bell">
+    Renders Blazorise `Alert` components for UI messages (info, warning, error, success) and notifications. Subscribes to `IUiMessageService` and `IUiNotificationService`.
+  </Card>
+  <Card title="PageAlert" icon="triangle-exclamation">
+    Renders `AlertManager.Alerts` as dismissible alert boxes. Used in layout components to display page-level messages (e.g., "Your session is about to expire").
+  </Card>
+  <Card title="SubmitButton" icon="check">
+    A Blazorise `Button` that disables itself during form submission (prevents double-submit). Tracks the `EditForm`'s submit state.
+  </Card>
+  <Card title="ToolbarButton" icon="wrench">
+    A button designed for the page toolbar area. Supports icons, visibility predicates, and policy-based authorization.
+  </Card>
+  <Card title="UiPageProgress" icon="spinner">
+    Renders the `IPageProgressService` progress indicator (a thin bar at the top of the page during navigation or long operations).
+  </Card>
+  <Card title="RadarSpinner" icon="rotate">
+    A CSS-based spinner component used inside loading overlays (the Blazor equivalent of `abp.ui.block`'s busy indicator).
+  </Card>
+</CardGroup>
+
+### DataGridEntityActionsColumn
+
+```csharp
+public class DataGridEntityActionsColumn<TItem> : AbpComponentBase
+{
+    // Renders EntityActions inside a DataGrid column
+    // Uses ActionType enum to determine icon vs text display
+}
+
+public enum ActionType
+{
+    Button,
+    DropdownItem
+}
+```
+
+## AbpCrudPageBase
+
+The most important base class for admin CRUD pages:
+
+```csharp
+public abstract class AbpCrudPageBase<
+    TAppService,
+    TEntityDto,
+    TKey,
+    TGetListInput,
+    TCreateInput,
+    TUpdateInput> : AbpComponentBase
+```
+
+It provides:
+- `Entities` list and paging (`TotalCount`, `CurrentPage`, `PageSize`)
+- `CreateModal` / `EditModal` `Modal` references
+- `GetEntitiesAsync()`, `CreateEntityAsync()`, `UpdateEntityAsync()`, `DeleteEntityAsync()`
+- `OpenCreateModalAsync()`, `OpenEditModalAsync(TEntityDto entity)`
+- Authorization checks (`HasCreatePermission`, `HasUpdatePermission`, `HasDeletePermission`)
+- `ObjectExtensionMappingHelper` for handling extra properties
+
+## MudBlazor Integration
+
+ABP provides a parallel component library based on MudBlazor (`Volo.Abp.AspNetCore.Components.Web.Theming.MudBlazor`). The MudBlazor variant:
+
+- Replaces Blazorise components with MudBlazor equivalents (`MudDataGrid`, `MudDialog`, etc.)
+- Has its own `AbpMudBlazorUIModule` and `AbpAspNetCoreComponentsWebThemingMudBlazorModule`
+- Uses `ITheme` from `Volo.Abp.AspNetCore.Components.Web.Theming.MudBlazor` (returns `Type` of the layout component rather than a path string)
+- The `MudBlazorBasicTheme` registers itself in `AbpThemingOptions` identically to the Blazorise `BasicTheme`
+
+The MudBlazor `ITheme` interface differs slightly from the MVC and Blazorise theme interfaces:
+
+```csharp
+// Blazor / MudBlazor theme (returns a Type for use as a layout)
+public interface ITheme
+{
+    Type GetLayout(string name, bool fallbackToDefault = true);
+}
+
+// MVC theme (returns a Razor view path string)
+public interface ITheme // Volo.Abp.AspNetCore.Mvc.UI.Theming
+{
+    string GetLayout(string name, bool fallbackToDefault = true);
+}
+```
+
+## Exception Handling in Blazor
+
+ABP adds `AbpExceptionHandlingLoggerProvider` to the WASM logging pipeline:
+
+```csharp
+context.Services.GetHostBuilder().Logging
+    .AddProvider(new AbpExceptionHandlingLoggerProvider(context.Services))
+    .AddFilter<AbpExceptionHandlingLoggerProvider>(
+        typeof(UserExceptionInformer).FullName, LogLevel.None);
+```
+
+This provider intercepts unhandled exceptions logged by Blazor and pipes them to `IUiMessageService` (showing a modal error message to the user) while suppressing `UserExceptionInformer` noise. For Blazor Server, `DetailedErrors = true` is enabled in development, which causes the SignalR error messages to include stack traces in the browser DevTools.
+
+### ClientProxyExceptionEventHandler (WASM)
+
+In WASM, `ClientProxyExceptionEventHandler` listens for `AbpRemoteCallException` events from the HTTP client proxy layer and translates them into user-visible error messages via `IUiMessageService`. This is the equivalent of ABP MVC's global exception filter for the browser context.
+
+## BlazoriseUiPageProgressService
+
+```csharp
+public class BlazoriseUiPageProgressService : IPageProgressService, IScopedDependency
+{
+    // Emits progress events consumed by UiPageProgress component
+    // Used for navigation progress bars
+}
+```
+
+Typically called by the router's `OnNavigating` event handler in the main layout to show a progress bar during page transitions.

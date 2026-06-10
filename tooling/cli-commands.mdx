@@ -1,0 +1,375 @@
+---
+title: "ABP CLI Command Reference: All Built-in Commands"
+sidebarTitle: "CLI Commands"
+description: "Complete reference for every built-in ABP CLI command: new, add-module, add-package, generate-proxy, remove-proxy, bundle, build, clean, login, logout, list-modules, list-templates, get-source, and more."
+---
+
+Every ABP CLI command is an `IConsoleCommand` implementation registered in `AbpCliOptions.Commands` by `AbpCliCoreModule`. Commands receive a `CommandLineArgs` struct that carries the parsed command name, positional target, and an options dictionary. The sections below document each command's purpose, key flags, and what it does under the hood.
+
+## Command quick-reference
+
+| Command | Class | Short description |
+|---|---|---|
+| `new` | `NewCommand` | Scaffold a new solution from a startup template |
+| `add-module` | `AddModuleCommand` | Add a multi-package ABP module to a solution |
+| `add-package` | `AddPackageCommand` | Add a single ABP NuGet or NPM package to a project |
+| `generate-proxy` | `GenerateProxyCommand` | Generate client service proxies from a live API |
+| `remove-proxy` | `RemoveProxyCommand` | Remove previously generated service proxies |
+| `bundle` | `BundleCommand` | Bundle third-party scripts/styles for Blazor WASM / MAUI Blazor |
+| `build` | `BuildCommand` | Build changed projects in a repository or a solution |
+| `clean` | `CleanCommand` | Delete all `bin` and `obj` folders under the current directory |
+| `login` | `LoginCommand` | Authenticate with ABP account |
+| `logout` | `LogoutCommand` | Clear the stored authentication token |
+| `login-info` | `LoginInfoCommand` | Display current login details |
+| `list-modules` | `ListModulesCommand` | List available open-source (and optionally Pro) modules |
+| `list-templates` | `ListTemplatesCommand` | List available startup templates from abp.io |
+| `get-source` | `GetSourceCommand` | Download the source code of a module |
+| `update` | `UpdateCommand` | Update all ABP NuGet packages in a solution |
+| `install-libs` | `InstallLibsCommand` | Install client-side library dependencies |
+| `switch-to-preview` | `SwitchToPreviewCommand` | Switch ABP packages to latest preview version |
+| `switch-to-stable` | `SwitchToStableCommand` | Switch ABP packages back to latest stable version |
+| `switch-to-nightly` | `SwitchToNightlyCommand` | Switch ABP packages to nightly builds |
+| `translate` | `TranslateCommand` | Batch-translate ABP localization JSON files |
+| `suite` | `SuiteCommand` | Launch or manage ABP Suite |
+| `clear-download-cache` | `ClearDownloadCacheCommand` | Remove cached template/source ZIP files |
+
+---
+
+## `new`
+
+**Class:** `NewCommand` — extends `ProjectCreationCommandBase`
+
+Scaffolds a new solution from an ABP startup template. Internally it builds a `ProjectBuildArgs` object and calls `TemplateProjectBuilder.BuildAsync(args)`, which downloads the template ZIP from abp.io (or a local path), runs the `ProjectBuildPipeline`, and extracts the result to disk.
+
+```
+abp new <project-name> [options]
+```
+
+### Key options
+
+| Flag | Default | Description |
+|---|---|---|
+| `-t\|--template` | `app` | Template name (`app`, `app-nolayers`, `module`, `console`, …) |
+| `-u\|--ui` | `mvc` | UI framework (`mvc`, `angular`, `blazor`, `blazor-server`, `blazor-webapp`, `maui-blazor`, `none`) |
+| `-d\|--database-provider` | `ef` | `ef` or `mongodb` |
+| `--dbms` | SQL Server | `sqlserver`, `mysql`, `postgresql`, `oracle`, `sqlite` |
+| `-o\|--output-folder` | current dir | Where to extract the solution |
+| `-v\|--version` | latest | ABP version to use |
+| `--tiered` | false | Separate auth-server and API host |
+| `--theme` | `leptonx-lite` | UI theme (`leptonx-lite`, `leptonx`, `basic`, `lepton`) |
+| `--connection-string` | — | Override the default connection string |
+| `-sib\|--skip-installing-libs` | false | Skip `abp install-libs` after creation |
+| `-sb\|--skip-bundling` | false | Skip `abp bundle` for Blazor WASM |
+| `--no-random-port` | false | Keep template default localhost ports |
+
+### Post-creation steps
+
+After extraction, `NewCommand.ExecuteAsync` automatically:
+
+1. Creates OpenIddict PFX certificate files (`CreateOpenIddictPfxFilesAsync`)
+2. Runs `dotnet build` for microservice service templates
+3. Creates initial EF Core migrations (`CreateInitialMigrationsAsync`)
+4. Runs `abp install-libs` (unless `--skip-installing-libs`)
+5. Runs `abp bundle` for Blazor WASM (unless `--skip-bundling`)
+6. Opens the relevant documentation page in the browser (unless `--no-open-web-page`)
+
+---
+
+## `add-module`
+
+**Class:** `AddModuleCommand`
+
+Adds a multi-package ABP module to an existing solution. It must be run from a directory containing a `.sln` or `.slnx` file (or you can pass `-s`).
+
+```
+abp add-module <module-name> [options]
+```
+
+Internally, `SolutionModuleAdder.AddAsync` is called. It:
+
+1. Fetches module metadata from abp.io
+2. Identifies which NuGet packages the module exposes
+3. Matches each package to the corresponding project in the solution (e.g., `.Application` package → `.Application.csproj`)
+4. Adds each NuGet reference and injects `[DependsOn(...)]` attributes via `ModuleClassDependcyAdder`
+5. Optionally creates a new EF Core migration
+
+### Key options
+
+| Flag | Description |
+|---|---|
+| `--new` | Creates a fresh local module instead of referencing published packages |
+| `--with-source-code` | Downloads the module source instead of using NuGet references |
+| `--add-to-solution-file` | Adds the downloaded source projects to the `.sln` (only with `--with-source-code`) |
+| `--skip-db-migrations` | Skips EF Core migration creation (always true with `--new`) |
+| `-s\|--solution` | Path to the solution file |
+| `-v\|--version` | Specific ABP version; defaults to the solution's current ABP version |
+| `-sp\|--startup-project` | Relative path to the startup project for migration commands |
+
+<Note>
+Some modules (like `Volo.Abp.LeptonXTheme.Pro`) are explicitly blocked in `AbpCliOptions.DisabledModulesToAddToSolution` and cannot be added with this command.
+</Note>
+
+---
+
+## `add-package`
+
+**Class:** `AddPackageCommand`
+
+Adds a single ABP NuGet or NPM package to a project. The command detects package type: names starting with `@` are treated as NPM packages; everything else is NuGet.
+
+```
+abp add-package <package-name> [options]
+```
+
+For NuGet packages, `ProjectNugetPackageAdder` adds the `<PackageReference>` to the `.csproj` and injects the corresponding `[DependsOn(typeof(...))]` attribute to the ABP module class. For NPM packages, `ProjectNpmPackageAdder` updates `package.json`.
+
+### Key options
+
+| Flag | Description |
+|---|---|
+| `-p\|--project` | Target `.csproj` file (NuGet only) |
+| `-s\|--solution` | Solution file to resolve project from |
+| `-v\|--version` | Package version; defaults to solution's ABP version |
+| `--with-source-code` | Download source instead of referencing the NuGet package |
+| `--add-to-solution-file` | Include downloaded source project in `.sln` |
+| `-ad\|--angular-directory` | Angular project directory (NPM packages) |
+
+---
+
+## `generate-proxy`
+
+**Class:** `GenerateProxyCommand` — extends `ProxyCommandBase<GenerateProxyCommand>`
+
+Generates typed client-side service proxies (TypeScript/Angular, plain JavaScript, or C#) by reading the `/api/abp/api-definition` endpoint from a running ABP application.
+
+```
+abp generate-proxy -t <type> [options]
+```
+
+`ProxyCommandBase.ExecuteAsync` looks up the generator type in `AbpCliServiceProxyOptions.Generators` and calls `IServiceProxyGenerator.GenerateProxyAsync(args)`.
+
+### Generator types
+
+| Type flag | Generator class | Output |
+|---|---|---|
+| `ng` | `AngularServiceProxyGenerator` | Angular services + TypeScript DTOs |
+| `js` | `JavaScriptServiceProxyGenerator` | Plain `.js` proxy file |
+| `csharp` | `CSharpServiceProxyGenerator` | C# client classes + DTO types |
+
+### Key options
+
+| Flag | Description |
+|---|---|
+| `-t\|--type` | `ng`, `js`, or `csharp` (**required**) |
+| `-u\|--url` | API definition URL (e.g., `https://localhost:44302/`) |
+| `-m\|--module` | Backend module name (default: `app`) |
+| `--folder` | Folder for generated C# code (default: `ClientProxies`) |
+| `-o\|--output` | Output file/folder for JS proxies |
+| `--without-contracts` | C# only — skip DTO and interface generation |
+| `-a\|--api-name` | Angular API endpoint name (default: `default`) |
+| `-s\|--source` | Angular source project name |
+| `--target` | Angular target project name |
+
+---
+
+## `remove-proxy`
+
+**Class:** `RemoveProxyCommand` — extends `ProxyCommandBase<RemoveProxyCommand>`
+
+Deletes previously generated proxy files. Accepts the same `-t`, `-m`, `-o`, and `--folder` flags as `generate-proxy`. The generator's `GenerateProxyAsync` is called in "remove" mode (the `CommandName` is `"remove-proxy"`).
+
+```
+abp remove-proxy -t ng
+abp remove-proxy -t csharp --folder MyProxies/InnerFolder
+```
+
+---
+
+## `bundle`
+
+**Class:** `BundleCommand`
+
+Scans a Blazor WebAssembly or MAUI Blazor project for ABP module style/script contributions and rewrites `index.html` with correct `<link>` and `<script>` tags. Delegates to `IBundlingService.BundleAsync`.
+
+```
+abp bundle [options]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `-wd\|--working-directory` | current dir | Project root to scan |
+| `-t\|--project-type` | `webassembly` | `webassembly` or `maui-blazor` |
+| `-f\|--force` | false | Force project rebuild before bundling |
+
+---
+
+## `build`
+
+**Class:** `BuildCommand`
+
+Smart incremental build for ABP repository development. Reads a `abp-build-config.json` configuration file, determines which projects changed (via Git diff), resolves transitive dependencies, and invokes `dotnet build` only on affected projects.
+
+```
+abp build [options]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `-wd\|--working-directory` | current dir | Repository root |
+| `-a\|--dotnet-build-arguments` | — | Extra arguments forwarded to `dotnet build` |
+| `-n\|--build-name` | — | Named build; status is persisted by `IRepositoryBuildStatusStore` |
+| `-f\|--force` | false | Build all projects regardless of changes |
+
+<Note>
+When a `.sln`/`.slnx` file path is present in the build config, the command builds the full solution with `DotNetProjectBuilder.BuildSolution` instead of the changed-project mode.
+</Note>
+
+---
+
+## `clean`
+
+**Class:** `CleanCommand`
+
+Runs `dotnet clean` on the current directory, then recursively deletes all `bin` and `obj` directories (skipping paths inside `node_modules`).
+
+```
+abp clean
+```
+
+No options. Useful before switching branches or when debugging stale build artifacts.
+
+---
+
+## `login`
+
+**Class:** `LoginCommand`
+
+Authenticates the local machine with `account.abp.io`. The access token is stored locally via `AuthService` and is used by commands that access Pro content (template downloads, module source code).
+
+```
+abp login <username>
+abp login <username> -p <password>
+abp login --device
+```
+
+| Flag | Description |
+|---|---|
+| `-p\|--password` | Password (prompted interactively if omitted) |
+| `--device` | Device-code flow — opens a browser; required for accounts with 2FA |
+| `-o\|--organization` | Organization slug (required for multi-org accounts) |
+
+---
+
+## `logout`
+
+**Class:** `LogoutCommand`
+
+Removes the stored access token. No options.
+
+```
+abp logout
+```
+
+---
+
+## `list-modules`
+
+**Class:** `ListModulesCommand`
+
+Fetches the module catalog from abp.io via `ModuleInfoProvider` and prints a formatted table. Free modules are always shown; Pro modules are hidden unless `--include-pro-modules` is passed.
+
+```
+abp list-modules
+abp list-modules --include-pro-modules
+```
+
+---
+
+## `list-templates`
+
+**Class:** `ListTemplatesCommand`
+
+Calls `https://www.abp.io/api/download/templates/` and prints each template's `Name`, `DisplayName`, and `DocumentUrl`.
+
+```
+abp list-templates
+```
+
+---
+
+## `get-source`
+
+**Class:** `GetSourceCommand`
+
+Downloads the complete source code of an ABP module (open-source or Pro) as a ZIP and extracts it locally. Uses `SourceCodeDownloadService.DownloadModuleAsync` which handles authentication for Pro modules.
+
+```
+abp get-source <module-name> [options]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `-o\|--output-folder` | current dir | Where to place the extracted source |
+| `-v\|--version` | latest | Specific ABP version to download |
+| `--preview` | false | Use latest pre-release version |
+| `--abp-path` | — | Override with a local ABP repository clone |
+| `--volo-path` | — | Override with a local Volo repository clone |
+
+---
+
+## `update`
+
+**Class:** `UpdateCommand`
+
+Updates all ABP NuGet packages in a solution to the latest (or a specified) version. Internally uses `VoloNugetPackagesVersionUpdater`.
+
+```
+abp update [options]
+```
+
+| Flag | Description |
+|---|---|
+| `-v\|--version` | Target version; omit for latest stable |
+| `--preview` | Use latest pre-release |
+| `--npm` | Also update ABP NPM packages |
+| `--stable` | Force stable channel even if on a preview install |
+| `-s\|--solution` | Path to the `.sln` file |
+| `-sp\|--startup-project` | Startup project for migration commands |
+| `--check-all` | Check all packages, not just ABP ones |
+
+---
+
+## `install-libs`
+
+**Class:** `InstallLibsCommand`
+
+Installs client-side library dependencies defined in `abp.resourcemapping.js` (for MVC/Razor Pages projects) or runs `npm install` + `abp install-libs` for Angular projects.
+
+---
+
+## Additional commands
+
+<CardGroup cols={2}>
+  <Card title="switch-to-preview" icon="flask">
+    Switches all ABP packages in the solution to the latest preview version on the configured NuGet feed.
+  </Card>
+  <Card title="switch-to-stable" icon="shield-check">
+    Reverts ABP packages to the latest stable release.
+  </Card>
+  <Card title="switch-to-nightly" icon="moon">
+    Points ABP packages to the nightly MyGet feed builds.
+  </Card>
+  <Card title="translate" icon="language">
+    Reads ABP localization JSON files and produces a batch translation file using machine translation or a custom provider.
+  </Card>
+  <Card title="suite" icon="wand-magic-sparkles">
+    Starts or manages ABP Suite (separate NuGet package). Registered in `AbpCliOptions.Commands` like any other command.
+  </Card>
+  <Card title="clear-download-cache" icon="trash">
+    Deletes cached template and source-code ZIP files stored in the local ABP CLI cache directory.
+  </Card>
+</CardGroup>
+
+<Warning>
+The `recreate-initial-migration` and `generate-razor-page` commands are decorated with `[HideFromCommandList]` and will not appear in `abp help` output, but they are fully functional and registered in `AbpCliOptions.Commands`.
+</Warning>

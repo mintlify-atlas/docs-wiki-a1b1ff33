@@ -1,0 +1,276 @@
+---
+title: "MongoDB Integration — ABP Framework"
+sidebarTitle: "MongoDB"
+description: "Internals of ABP's MongoDB support: AbpMongoDbContext, collection configuration, BSON serializer customizations, IMongoDbContextProvider, and data filtering via MongoDbRepositoryFilterer."
+---
+
+ABP's MongoDB integration mirrors the architecture of the EF Core layer but operates at the driver level rather than through an ORM. There is no change tracker, no migration infrastructure, and no compiled query cache — instead, ABP wires data filtering, BSON serialization, session-based transactions, and the Unit of Work directly into the MongoDB C# driver's `IMongoCollection<T>` API.
+
+## Core Types
+
+<CardGroup cols={2}>
+  <Card title="AbpMongoDbContext" icon="database">
+    Abstract base class for all MongoDB context classes. Implements `IAbpMongoDbContext` and `ITransientDependency`. Holds `IMongoDatabase`, `IMongoClient`, and the optional `IClientSessionHandle` for transactions.
+  </Card>
+  <Card title="IAbpMongoDbContext" icon="plug">
+    Minimal interface: `Client`, `Database`, `Collection<T>()`, and `SessionHandle`. Decouples repositories from the concrete context class.
+  </Card>
+  <Card title="IMongoDbContextProvider&lt;T&gt;" icon="link">
+    Resolves the correct `TMongoDbContext` for the current UoW and tenant. Default implementation: `UnitOfWorkMongoDbContextProvider<T>`.
+  </Card>
+  <Card title="MongoDbRepositoryFilterer&lt;T&gt;" icon="filter">
+    Builds `FilterDefinition<TEntity>` lists for soft-delete and multi-tenancy at query time. Registered as `IMongoDbRepositoryFilterer<TEntity>`.
+  </Card>
+</CardGroup>
+
+## `AbpMongoDbContext`
+
+```csharp
+public abstract class AbpMongoDbContext : IAbpMongoDbContext, ITransientDependency
+{
+    public IAbpLazyServiceProvider LazyServiceProvider { get; set; } = default!;
+    public IMongoModelSource ModelSource { get; set; } = default!;
+
+    public IMongoClient Client { get; private set; } = default!;
+    public IMongoDatabase Database { get; private set; } = default!;
+    public IClientSessionHandle? SessionHandle { get; private set; }
+
+    protected internal virtual void CreateModel(IMongoModelBuilder modelBuilder) { }
+
+    public virtual void InitializeDatabase(
+        IMongoDatabase database, IMongoClient client, IClientSessionHandle? sessionHandle)
+    {
+        Database = database;
+        Client = client;
+        SessionHandle = sessionHandle;
+    }
+
+    public virtual IMongoCollection<T> Collection<T>()
+    {
+        return Database.GetCollection<T>(GetCollectionName<T>());
+    }
+
+    protected virtual string GetCollectionName<T>()
+    {
+        return GetEntityModel<T>().CollectionName;
+    }
+}
+```
+
+### Collection configuration via `CreateModel`
+
+Override `CreateModel` in your context subclass to register entity-to-collection mappings and model options:
+
+```csharp
+public class BookStoreMongoDbContext : AbpMongoDbContext
+{
+    public IMongoCollection<Book> Books =>
+        Collection<Book>();
+
+    protected override void CreateModel(IMongoModelBuilder modelBuilder)
+    {
+        base.CreateModel(modelBuilder);
+
+        modelBuilder.Entity<Book>(b =>
+        {
+            b.CollectionName = "Books";
+        });
+    }
+}
+```
+
+`IMongoModelSource` caches the built model keyed by context type (singleton lifetime). The first call to `GetModel(context)` invokes `CreateModel` and caches the resulting `MongoDbContextModel`. Subsequent requests return the cached model.
+
+<Note>
+Unlike EF Core, there is no runtime migration or schema-creation for MongoDB. Collections are created on first write by the MongoDB server. Index creation is the application's responsibility (e.g., a startup hook or a migration worker).
+</Note>
+
+## `IMongoDbContextProvider<T>` and UoW Integration
+
+`UnitOfWorkMongoDbContextProvider<T>` (registered as the default implementation) follows the same pattern as the EF Core provider:
+
+1. Resolves the connection string from `AbpDbConnectionOptions` using the context's logical name
+2. Checks the active UoW's database-API store for an existing entry keyed by `(connectionString, contextType)`
+3. If not found, creates a new `IMongoDatabase`, optionally starts a `IClientSessionHandle` transaction (if `UnitOfWork.Options.IsTransactional`), constructs the `TMongoDbContext`, calls `InitializeDatabase`, and registers a `MongoDbDatabaseApi` in the UoW
+4. Returns the cached context for subsequent calls within the same UoW
+
+The `IClientSessionHandle` is stored directly on `AbpMongoDbContext.SessionHandle`. Repositories pass it to every driver call (`InsertOne`, `Find`, `FindOneAndUpdate`, etc.) to participate in the server-side transaction.
+
+### Multi-tenant connection strings
+
+Repositories that manage entities implementing `IMultiTenant` automatically resolve the current tenant's connection string:
+
+```csharp
+// MongoDbRepository — simplified
+protected Task<TMongoDbContext> GetDbContextAsync(CancellationToken cancellationToken = default)
+{
+    // Non-multi-tenant entities always use the host connection string
+    if (!EntityHelper.IsMultiTenant<TEntity>())
+    {
+        using (CurrentTenant.Change(null))
+        {
+            return DbContextProvider.GetDbContextAsync(cancellationToken);
+        }
+    }
+
+    return DbContextProvider.GetDbContextAsync(cancellationToken);
+}
+```
+
+When `CurrentTenant.Id` changes (e.g., inside `using (CurrentTenant.Change(tenantId))`), the provider resolves a different connection string and opens a separate `IMongoDatabase` handle for that tenant.
+
+## BSON Serializer Customizations
+
+ABP registers custom BSON serializers in the `AbpMongoDbModule` static constructor to enforce consistent wire formats:
+
+```csharp
+static AbpMongoDbModule()
+{
+    // Replace the default Guid serializer with Standard (UUID) representation
+    AbpBsonSerializer.RemoveSerializer<Guid>();
+    BsonSerializer.RegisterSerializer(new GuidSerializer(GuidRepresentation.Standard));
+    BsonTypeMapper.RegisterCustomTypeMapper(typeof(Guid), new AbpGuidCustomBsonTypeMapper());
+}
+```
+
+### `GuidSerializer(GuidRepresentation.Standard)`
+
+Serializes `Guid` as BSON subtype `0x04` (UUID), which is the MongoDB-standard representation. Without this override, the C# driver defaults to `GuidRepresentation.CSharpLegacy` (subtype `0x03`), which is incompatible with drivers in other languages.
+
+```csharp
+// AbpGuidCustomBsonTypeMapper — used when mapping from BsonValue back to Guid
+public class AbpGuidCustomBsonTypeMapper : ICustomBsonTypeMapper
+{
+    public bool TryMapToBsonValue(object value, out BsonValue bsonValue)
+    {
+        bsonValue = new BsonBinaryData((Guid)value, GuidRepresentation.Standard);
+        return true;
+    }
+}
+```
+
+### `AbpMongoDbDateTimeSerializer`
+
+Controls the `DateTimeKind` of deserialized `DateTime` values and optionally disables normalization (UTC conversion):
+
+```csharp
+public class AbpMongoDbDateTimeSerializer : StructSerializerBase<DateTime>
+{
+    protected DateTimeKind DateTimeKind { get; set; }
+    protected bool DisableDateTimeNormalization { get; set; }
+
+    public override void Serialize(
+        BsonSerializationContext context,
+        BsonSerializationArgs args,
+        DateTime value)
+    {
+        context.Writer.WriteDateTime(DisableDateTimeNormalization
+            ? ToMillisecondsSinceEpoch(value)
+            : ToMillisecondsSinceEpoch(DateTime.SpecifyKind(value, DateTimeKind)));
+    }
+
+    public override DateTime Deserialize(
+        BsonDeserializationContext context,
+        BsonDeserializationArgs args)
+    {
+        var dateTime = new BsonDateTime(context.Reader.ReadDateTime()).ToUniversalTime();
+        return DateTime.SpecifyKind(dateTime,
+            DisableDateTimeNormalization ? DateTimeKind.Unspecified : DateTimeKind);
+    }
+}
+```
+
+Configure via `AbpMongoDbOptions.DateTimeSerializer` at module startup.
+
+## Data Filtering
+
+MongoDB does not support EF Core-style global query filters. Instead, ABP uses `IMongoDbRepositoryFilterer<TEntity>` to inject additional `FilterDefinition<TEntity>` clauses into every repository query:
+
+```csharp
+public class MongoDbRepositoryFilterer<TEntity> : IMongoDbRepositoryFilterer<TEntity>
+    where TEntity : class, IEntity
+{
+    protected IDataFilter DataFilter { get; }
+    protected ICurrentTenant CurrentTenant { get; }
+
+    public virtual Task AddGlobalFiltersAsync(List<FilterDefinition<TEntity>> filters)
+    {
+        if (typeof(ISoftDelete).IsAssignableFrom(typeof(TEntity))
+            && DataFilter.IsEnabled<ISoftDelete>())
+        {
+            filters.Add(Builders<TEntity>.Filter.Eq(
+                e => ((ISoftDelete)e).IsDeleted, false));
+        }
+
+        if (typeof(IMultiTenant).IsAssignableFrom(typeof(TEntity)))
+        {
+            var tenantId = CurrentTenant.Id;
+            filters.Add(Builders<TEntity>.Filter.Eq(
+                e => ((IMultiTenant)e).TenantId, tenantId));
+        }
+
+        return Task.CompletedTask;
+    }
+}
+```
+
+The repository builds a combined filter for every `Find`, `FindOneAndUpdate`, and `DeleteOne` call:
+
+```csharp
+// Inside MongoDbRepository — conceptual summary
+var filters = new List<FilterDefinition<TEntity>>();
+foreach (var filterer in RepositoryFilterers)
+{
+    await filterer.AddGlobalFiltersAsync(filters);
+}
+// add the caller's predicate
+var combinedFilter = Builders<TEntity>.Filter.And(filters);
+var cursor = await collection.FindAsync(combinedFilter, ...);
+```
+
+<Warning>
+Because MongoDB filtering is applied in-process (by the driver, not the server-side query planner with indexed filters), disabling `ISoftDelete` via `IDataFilter.Disable<ISoftDelete>()` is cheap — the filterer simply skips adding that `FilterDefinition`. However, ensure your MongoDB indexes cover both filtered and unfiltered query patterns when you need to query deleted records.
+</Warning>
+
+## Repository Differences vs EF Core
+
+| Concern | EF Core (`AbpDbContext`) | MongoDB (`AbpMongoDbContext`) |
+|---|---|---|
+| Change tracking | EF Core change tracker | None — caller must explicitly call Insert/Update/Delete |
+| `SaveChangesAsync` | Flushes tracked changes | No-op concept; writes are immediate unless inside a session transaction |
+| Transaction | `IDbTransaction` via EF Core | `IClientSessionHandle` (requires replica set or mongos) |
+| Soft-delete | Global query filter (SQL `WHERE IsDeleted = 0`) | `FilterDefinition<T>` added per-query |
+| Multi-tenancy filter | Global query filter (SQL `WHERE TenantId = @p`) | `FilterDefinition<T>` added per-query |
+| Concurrency check | `IsConcurrencyToken` / `DbUpdateConcurrencyException` | `IHasConcurrencyStamp` matched via `Filter.Eq(ConcurrencyStamp, ...)` |
+| LINQ support | Full EF Core LINQ-to-SQL | MongoDB LINQ provider (subset of LINQ) |
+| Outbox/Inbox storage | EF-backed tables | Dedicated MongoDB collections via `IHasEventOutbox` / `IHasEventInbox` |
+
+## Module Registration
+
+`AbpMongoDbModule` registers all infrastructure types. The relevant `ConfigureServices` entries:
+
+```csharp
+// Default IMongoDbContextProvider<> implementation
+context.Services.TryAddTransient(
+    typeof(IMongoDbContextProvider<>),
+    typeof(UnitOfWorkMongoDbContextProvider<>));
+
+// Default repository filterers
+context.Services.TryAddEnumerable(ServiceDescriptor.Transient(
+    typeof(IMongoDbRepositoryFilterer<>),
+    typeof(MongoDbRepositoryFilterer<>)));
+
+context.Services.TryAddEnumerable(ServiceDescriptor.Transient(
+    typeof(IMongoDbRepositoryFilterer<,>),
+    typeof(MongoDbRepositoryFilterer<,>)));
+
+// Outbox / inbox collection support
+context.Services.AddTransient(
+    typeof(IMongoDbContextEventOutbox<>),
+    typeof(MongoDbContextEventOutbox<>));
+context.Services.AddTransient(
+    typeof(IMongoDbContextEventInbox<>),
+    typeof(MongoDbContextEventInbox<>));
+```
+
+The `AbpMongoDbConventionalRegistrar` scans assemblies during module startup and auto-registers `AbpMongoDbContext` subclasses and their repositories following the same conventions as the EF Core registrar.
