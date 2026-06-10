@@ -89,6 +89,21 @@ classDiagram
     IBasicRepository_TEntity_TKey <|-- IRepository_TEntity_TKey
 ```
 
+### `IRepository` — the root marker
+
+The root `IRepository` interface (non-generic) defines only three members that every repository must expose:
+
+```csharp
+public interface IRepository
+{
+    bool? IsChangeTrackingEnabled { get; }
+    string? EntityName { get; set; }
+    string ProviderName { get; }
+}
+```
+
+`ProviderName` identifies the underlying ORM (`"EntityFrameworkCore"`, `"MongoDB"`, etc.). `IsChangeTrackingEnabled` can be `null` (use the default policy), `true`, or `false`. `EntityName` is an optional label used for tracing and logging.
+
 ### `IReadOnlyBasicRepository<TEntity>`
 
 The root of all read operations. It does **not** require a queryable provider — implementations only need to produce materialised `List<T>` results:
@@ -134,6 +149,10 @@ public interface IReadOnlyRepository<TEntity> : IReadOnlyBasicRepository<TEntity
 ```
 
 `GetQueryableAsync()` is the primary hook: it returns an `IQueryable<TEntity>` that **already has data filters applied** (soft-delete, multi-tenancy). Callers should compose LINQ on top of it and materialise results via `AsyncExecuter` to remain provider-agnostic.
+
+<Note>
+`IReadOnlyRepository` also contains two `WithDetails()` overloads (without `Async`) that are marked `[Obsolete]`. Always use `WithDetailsAsync()` in new code.
+</Note>
 
 ### `IBasicRepository<TEntity>` — write operations
 
@@ -184,19 +203,62 @@ public interface IRepository<TEntity> : IReadOnlyRepository<TEntity>, IBasicRepo
 }
 ```
 
+The fully keyed `IRepository<TEntity, TKey>` composes `IRepository<TEntity>`, `IReadOnlyRepository<TEntity, TKey>`, and `IBasicRepository<TEntity, TKey>` — giving you every method in the hierarchy.
+
 <Warning>
 `DeleteDirectAsync` issues a bulk-delete SQL statement. It bypasses soft-delete filtering, multi-tenancy checks, domain events, and audit logging. Use it only for maintenance tasks or bulk cleanup where you explicitly want to skip those features.
 </Warning>
 
+## `BasicRepositoryBase<TEntity>` internals
+
+`BasicRepositoryBase<TEntity>` is the lowest shared implementation layer. It implements `IBasicRepository<TEntity>` and resolves all infrastructure services lazily through `IAbpLazyServiceProvider`:
+
+```csharp
+public abstract class BasicRepositoryBase<TEntity> :
+    IBasicRepository<TEntity>,
+    IServiceProviderAccessor,
+    IUnitOfWorkEnabled
+    where TEntity : class, IEntity
+{
+    public IAbpLazyServiceProvider LazyServiceProvider { get; set; } = default!;
+
+    public IDataFilter DataFilter
+        => LazyServiceProvider.LazyGetRequiredService<IDataFilter>();
+    public ICurrentTenant CurrentTenant
+        => LazyServiceProvider.LazyGetRequiredService<ICurrentTenant>();
+    public IAsyncQueryableExecuter AsyncExecuter
+        => LazyServiceProvider.LazyGetRequiredService<IAsyncQueryableExecuter>();
+    public IUnitOfWorkManager UnitOfWorkManager
+        => LazyServiceProvider.LazyGetRequiredService<IUnitOfWorkManager>();
+    public IEntityChangeTrackingProvider EntityChangeTrackingProvider
+        => LazyServiceProvider.LazyGetRequiredService<IEntityChangeTrackingProvider>();
+    public ILogger Logger
+        => LazyServiceProvider.LazyGetService<ILogger>(...);
+
+    public bool? IsChangeTrackingEnabled { get; protected set; }
+    public string? EntityName { get; set; }
+    public string ProviderName { get; }
+
+    protected BasicRepositoryBase(string providerName)
+    {
+        ProviderName = Check.NotNullOrWhiteSpace(providerName, nameof(providerName));
+    }
+}
+```
+
+It also provides `ShouldTrackingEntityChange()` — a method that respects the `IsChangeTrackingEnabled` flag first, then the `IEntityChangeTrackingProvider` (which checks `[EnableEntityChangeTracking]` / `[DisableEntityChangeTracking]` attributes on the call site), then defaults to `true`.
+
 ## `RepositoryBase<TEntity>` internals
 
-`RepositoryBase<TEntity>` provides a partial implementation shared by every concrete provider:
+`RepositoryBase<TEntity>` extends `BasicRepositoryBase<TEntity>` and adds the queryable (`IRepository<TEntity>`) contract:
 
 ```csharp
 public abstract class RepositoryBase<TEntity>
     : BasicRepositoryBase<TEntity>, IRepository<TEntity>, IUnitOfWorkManagerAccessor
     where TEntity : class, IEntity
 {
+    protected RepositoryBase(string providerName) : base(providerName) { }
+
     // Concrete provider must implement this
     public abstract Task<IQueryable<TEntity>> GetQueryableAsync();
 
@@ -242,7 +304,9 @@ public abstract class RepositoryBase<TEntity>
 }
 ```
 
-`BasicRepositoryBase<TEntity>` (the parent) provides lazy-resolved services — `DataFilter`, `CurrentTenant`, `UnitOfWorkManager`, `Logger`, `AsyncExecuter`, `EntityChangeTrackingProvider` — via `IAbpLazyServiceProvider`. It also implements the `ShouldTrackingEntityChange()` logic that respects `[EnableEntityChangeTracking]` / `[DisableEntityChangeTracking]` attributes and the `IsChangeTrackingEnabled` flag.
+`FindAsync`, `DeleteAsync(predicate)`, and `DeleteDirectAsync` are declared `abstract` here — concrete providers implement them. `GetAsync(predicate)` is implemented by delegating to the abstract `FindAsync`.
+
+There is also `RepositoryBase<TEntity, TKey>` which extends `RepositoryBase<TEntity>` and adds key-based `GetAsync(TKey)`, `FindAsync(TKey)`, `DeleteAsync(TKey)`, and `DeleteManyAsync(IEnumerable<TKey>)`.
 
 ### Async queryable execution
 
@@ -389,6 +453,8 @@ await _repository.InsertAsync(entity);
 // Flush immediately (useful in domain services that need the generated ID)
 var saved = await _repository.InsertAsync(entity, autoSave: true);
 ```
+
+The `SaveChangesAsync` implementation in `BasicRepositoryBase` delegates to `UnitOfWorkManager.Current?.SaveChangesAsync()` — if there is no active Unit of Work it is a no-op.
 
 <Tip>
 Prefer `autoSave: false` inside application services — the ABP Unit of Work middleware commits automatically at the end of the HTTP request, batching all changes into a single transaction.

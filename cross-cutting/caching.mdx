@@ -13,13 +13,13 @@ ABP wraps ASP.NET Core's `IDistributedCache` with a generic, type-safe abstracti
     ABP's generic, type-safe wrapper. Extends `IDistributedCache<TCacheItem, string>` and delegates all operations to the inner two-type-parameter implementation.
   </Card>
   <Card title="DistributedCache&lt;TCacheItem, TCacheKey&gt;" icon="gear">
-    The concrete class that serializes items, normalizes keys, handles UoW buffering, and catches/logs exceptions when `HideErrors = true`.
+    The concrete class that serializes items, normalizes keys, handles UoW buffering, and catches/logs exceptions when `HideErrors = true`. Registered as a **singleton** open-generic service.
   </Card>
   <Card title="DistributedCacheKeyNormalizer" icon="key">
     Produces the final string key in format `t:{tenantId},c:{cacheName},k:{prefix}{key}`. Omits tenant prefix when `IgnoreMultiTenancy` is set.
   </Card>
   <Card title="AbpDistributedCacheOptions" icon="sliders">
-    Global configuration: `KeyPrefix`, `HideErrors`, `GlobalCacheEntryOptions`, and per-cache configurator delegates.
+    Global configuration: `KeyPrefix`, `HideErrors`, `GlobalCacheEntryOptions` (default sliding expiration 20 minutes), and per-cache configurator delegates.
   </Card>
 </CardGroup>
 
@@ -34,6 +34,10 @@ public interface IDistributedCache<TCacheItem, TCacheKey>
     TCacheItem? Get(TCacheKey key, bool? hideErrors = null, bool considerUow = false);
     Task<TCacheItem?> GetAsync(TCacheKey key, bool? hideErrors = null,
         bool considerUow = false, CancellationToken token = default);
+
+    TCacheItem? GetOrAdd(TCacheKey key, Func<TCacheItem> factory,
+        Func<DistributedCacheEntryOptions>? optionsFactory = null,
+        bool? hideErrors = null, bool considerUow = false);
 
     Task<TCacheItem?> GetOrAddAsync(TCacheKey key,
         Func<Task<TCacheItem>> factory,
@@ -53,8 +57,19 @@ public interface IDistributedCache<TCacheItem, TCacheKey>
     KeyValuePair<TCacheKey, TCacheItem?>[] GetOrAddMany(...);
     Task<KeyValuePair<TCacheKey, TCacheItem?>[]> GetOrAddManyAsync(...);
 
+    void Refresh(TCacheKey key, bool? hideErrors = null);
+    Task RefreshAsync(TCacheKey key, bool? hideErrors = null,
+        CancellationToken token = default);
+    void RefreshMany(IEnumerable<TCacheKey> keys, bool? hideErrors = null);
+    Task RefreshManyAsync(IEnumerable<TCacheKey> keys, bool? hideErrors = null,
+        CancellationToken token = default);
+
     void Remove(TCacheKey key, bool? hideErrors = null, bool considerUow = false);
     Task RemoveAsync(TCacheKey key, bool? hideErrors = null,
+        bool considerUow = false, CancellationToken token = default);
+    void RemoveMany(IEnumerable<TCacheKey> keys, bool? hideErrors = null,
+        bool considerUow = false);
+    Task RemoveManyAsync(IEnumerable<TCacheKey> keys, bool? hideErrors = null,
         bool considerUow = false, CancellationToken token = default);
 }
 
@@ -64,7 +79,7 @@ public interface IDistributedCache<TCacheItem>
     where TCacheItem : class { }
 ```
 
-Inject `IDistributedCache<MyCacheItem>` into your service — no registration is needed because `DistributedCache<TCacheItem>` is an open-generic registration.
+Inject `IDistributedCache<MyCacheItem>` into your service — no registration is needed because `DistributedCache<TCacheItem>` and `DistributedCache<TCacheItem,TCacheKey>` are registered as open-generic **singletons** in `AbpCachingModule`.
 
 ## Naming Cache Items with CacheNameAttribute
 
@@ -121,9 +136,12 @@ public class AbpDistributedCacheOptions
 
     // Convenience helpers:
     public void ConfigureCache<TCacheItem>(DistributedCacheEntryOptions? options);
+    public void ConfigureCache(Type cacheItemType, DistributedCacheEntryOptions? options);
     public void ConfigureCache(string cacheName, DistributedCacheEntryOptions? options);
 }
 ```
+
+`AbpCachingModule` sets the default `GlobalCacheEntryOptions.SlidingExpiration` to **20 minutes** and, in development environments, automatically sets `HideErrors = false` so cache failures surface immediately.
 
 `CacheConfigurators` is a list of delegates, each given the cache name at construction time and returning options or `null`. `DistributedCache` iterates them in order; the first non-null result wins. Use `ConfigureCache<T>` which adds a name-matched delegate:
 
@@ -184,7 +202,7 @@ public virtual async Task<TCacheItem?> GetOrAddAsync(
 The outer fast-path check avoids lock contention for warm-cache scenarios. The inner double-check inside the semaphore prevents duplicate factory invocations under concurrent cold-start.
 
 <Note>
-`SyncSemaphore` is a `SemaphoreSlim(1,1)` scoped to each `DistributedCache<TCacheItem, TCacheKey>` instance (which is registered as transient). For concurrent access from multiple instances (e.g., different requests), rely on the backing store's atomicity — the double-check still prevents calling `factory()` twice within a single instance's lifetime.
+`SyncSemaphore` is a `SemaphoreSlim(1,1)` on each `DistributedCache<TCacheItem, TCacheKey>` instance. Because the cache is registered as a **singleton**, one instance is shared across all requests for a given `TCacheItem`/`TCacheKey` pair. This means the semaphore effectively serializes stampede protection application-wide for each cache type.
 </Note>
 
 ## UoW-Aware Cache
@@ -251,7 +269,7 @@ If you call `SetAsync` with `considerUow: true` but then the UoW rolls back, the
 
 ## Error Handling
 
-When `HideErrors = true` (the default), any exception from the backing `IDistributedCache` is logged at `Warning` level, notified via `IExceptionNotifier`, and suppressed — `Get`/`GetAsync` return `null`, `Set`/`Remove` silently no-op. Set `HideErrors = false` to propagate exceptions, which is recommended in development.
+When `HideErrors = true` (the default in production; `false` in development), any exception from the backing `IDistributedCache` is logged at `Warning` level, notified via `IExceptionNotifier`, and suppressed — `Get`/`GetAsync` return `null`, `Set`/`Remove` silently no-op. Set `HideErrors = false` to propagate exceptions, which is automatically done in development environments by `AbpCachingModule`.
 
 ```csharp
 try
@@ -275,7 +293,7 @@ ABP checks whether the backing `IDistributedCache` implementation also implement
 
 ## Hybrid Cache Integration
 
-`Volo.Abp.Caching` ships a `Hybrid` folder that wraps ASP.NET Core's `HybridCache` (introduced in .NET 9) with the same ABP conventions. The interface mirrors `IDistributedCache<T>` but uses `HybridCacheEntryOptions`:
+`Volo.Abp.Caching` ships a `Hybrid` namespace that wraps ASP.NET Core's `HybridCache` (introduced in .NET 9) with the same ABP conventions. The interface mirrors `IDistributedCache<T>` but uses `HybridCacheEntryOptions`:
 
 ```csharp
 public interface IHybridCache<TCacheItem, TCacheKey>
@@ -303,7 +321,7 @@ public interface IHybridCache<TCacheItem, TCacheKey>
 }
 ```
 
-`IHybridCache<TCacheItem>` defaults `TCacheKey` to `string` and exposes an `InternalCache` property.
+`IHybridCache<TCacheItem>` defaults `TCacheKey` to `string` and exposes an `InternalCache` property. Both `IHybridCache<>` and `IHybridCache<,>` are also registered as open-generic **singletons** in `AbpCachingModule`.
 
 <Tip>
 Prefer `IHybridCache<T>` over `IDistributedCache<T>` when targeting .NET 9+ — `HybridCache` uses an in-process L1 cache in addition to the distributed L2 store, eliminating a network round-trip for the hot path without any code changes.

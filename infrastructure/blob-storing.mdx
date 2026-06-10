@@ -39,6 +39,8 @@ public interface IBlobContainer
 }
 ```
 
+`GetAsync` throws `AbpException` if the blob is not found. Use `GetOrNullAsync` when absence is an expected case.
+
 The generic form `IBlobContainer<TContainer>` inherits from `IBlobContainer` and allows typed injection scoped to a specific container:
 
 ```csharp
@@ -64,11 +66,16 @@ public interface IBlobProvider
 }
 ```
 
-`BlobProviderBase` is the recommended base class. It adds the `TryCopyToMemoryStreamAsync` helper, which copies a stream into a detached `MemoryStream` (necessary when the underlying SDK returns a non-seekable or connection-tied stream):
+`BlobProviderBase` is the recommended base class. All four methods are declared `abstract` — subclasses must implement all of them. It adds the `TryCopyToMemoryStreamAsync` helper, which copies a stream into a detached `MemoryStream` (necessary when the underlying SDK returns a non-seekable or connection-tied stream):
 
 ```csharp
 public abstract class BlobProviderBase : IBlobProvider
 {
+    public abstract Task SaveAsync(BlobProviderSaveArgs args);
+    public abstract Task<bool> DeleteAsync(BlobProviderDeleteArgs args);
+    public abstract Task<bool> ExistsAsync(BlobProviderExistsArgs args);
+    public abstract Task<Stream?> GetOrNullAsync(BlobProviderGetArgs args);
+
     protected virtual async Task<Stream?> TryCopyToMemoryStreamAsync(
         Stream? stream,
         CancellationToken cancellationToken = default)
@@ -107,15 +114,31 @@ public class BlobContainerConfiguration
     public Type? ProviderType { get; set; }
     public bool IsMultiTenant { get; set; } = true;
     public ITypeList<IBlobNamingNormalizer> NamingNormalizers { get; }
+
     // Key-value property bag for provider-specific config
+    public T? GetConfigurationOrDefault<T>(string name, T? defaultValue = default);
+    public object? GetConfigurationOrNull(string name, object? defaultValue = null);
+    public BlobContainerConfiguration SetConfiguration(string name, object? value);
+    public BlobContainerConfiguration ClearConfiguration(string name);
 }
 ```
 
 `ProviderType` determines which registered `IBlobProvider` handles this container. Providers read their configuration from the property bag via `GetConfigurationOrDefault<T>(name)`.
 
+Each `BlobContainerConfiguration` accepts an optional `fallbackConfiguration` in its constructor. `GetConfigurationOrNull` walks the fallback chain before returning null — new named containers automatically receive the `DefaultContainer` configuration as their fallback.
+
 ### AbpBlobStoringOptions
 
-`AbpBlobStoringOptions` holds a `BlobContainerConfigurations` registry. Configure containers in your module:
+`AbpBlobStoringOptions` holds a `BlobContainerConfigurations` registry:
+
+```csharp
+public class AbpBlobStoringOptions
+{
+    public BlobContainerConfigurations Containers { get; }
+}
+```
+
+Configure containers in your module:
 
 ```csharp
 Configure<AbpBlobStoringOptions>(options =>
@@ -139,13 +162,13 @@ Configure<AbpBlobStoringOptions>(options =>
 });
 ```
 
-New containers inherit from `DefaultContainer`'s configuration via the fallback chain in `BlobContainerConfiguration.GetConfigurationOrNull`.
+`BlobContainerConfigurations` pre-populates a `DefaultContainer` entry. Calls to `Configure<TContainer>` create a new `BlobContainerConfiguration` backed by `Default` as its fallback if the container does not already exist. `ConfigureAll` iterates every registered container.
 
 ---
 
 ## BlobContainer: The Execution Pipeline
 
-`BlobContainer` (the non-generic runtime implementation) orchestrates the full pipeline on every operation:
+`BlobContainer` (the non-generic runtime implementation) orchestrates the full pipeline on every operation. The generic `BlobContainer<TContainer>` is a thin wrapper that delegates to a plain `BlobContainer` created by `IBlobContainerFactory`:
 
 ```csharp
 public virtual async Task SaveAsync(
@@ -173,16 +196,18 @@ public virtual async Task SaveAsync(
 }
 ```
 
+`GetTenantIdOrNull` returns `CurrentTenant.Id` when `Configuration.IsMultiTenant` is `true`, or `null` otherwise.
+
 The sequence is:
 <Steps>
   <Step title="Tenant isolation">
-    If `Configuration.IsMultiTenant` is true, switches the ambient tenant context to `CurrentTenant.Id`. This scopes blob names to the current tenant.
+    `CurrentTenant.Change(GetTenantIdOrNull())` switches the ambient tenant context. When `IsMultiTenant` is `true` this scopes blob names to the current tenant.
   </Step>
   <Step title="Naming normalization">
     `BlobNormalizeNamingService.NormalizeNaming` runs the ordered `NamingNormalizers` chain to transform both the container name and blob name (e.g., lowercasing for Azure, replacing slashes for S3).
   </Step>
   <Step title="Provider dispatch">
-    The resolved `IBlobProvider` receives a `BlobProviderSaveArgs` containing the normalized names, the configuration, and the stream.
+    The resolved `IBlobProvider` receives a strongly-typed args object containing the normalized names, the configuration, and the stream.
   </Step>
 </Steps>
 
@@ -216,12 +241,24 @@ public BlobNormalizeNaming NormalizeNaming(
 
 ## DefaultBlobProviderSelector
 
-`DefaultBlobProviderSelector` resolves which registered `IBlobProvider` instance handles a given container. It reads the container's `ProviderType` from configuration and finds a matching provider among all registered `IEnumerable<IBlobProvider>`:
+`DefaultBlobProviderSelector` resolves which registered `IBlobProvider` instance handles a given container. It reads the container's `ProviderType` from `IBlobContainerConfigurationProvider` and finds a matching provider among all registered `IEnumerable<IBlobProvider>`:
 
 ```csharp
 public virtual IBlobProvider Get(string containerName)
 {
     var configuration = ConfigurationProvider.Get(containerName);
+
+    if (!BlobProviders.Any())
+    {
+        throw new AbpException(
+            "No BLOB Storage provider was registered! ...");
+    }
+
+    if (configuration.ProviderType == null)
+    {
+        throw new AbpException(
+            "No BLOB Storage provider was used! ...");
+    }
 
     foreach (var provider in BlobProviders)
     {
@@ -232,7 +269,9 @@ public virtual IBlobProvider Get(string containerName)
         }
     }
 
-    throw new AbpException($"Could not find the BLOB Storage provider...");
+    throw new AbpException(
+        $"Could not find the BLOB Storage provider with the type " +
+        $"({configuration.ProviderType.AssemblyQualifiedName}) configured for the container {containerName}...");
 }
 ```
 

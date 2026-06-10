@@ -49,13 +49,45 @@ public class IdentityUser : FullAuditedAggregateRoot<Guid>, IUser, IHasEntityVer
 {
     public virtual Guid? TenantId { get; protected set; }
     public virtual string UserName { get; protected internal set; }
+
+    [DisableAuditing]
+    public virtual string NormalizedUserName { get; protected internal set; }
+
+    [CanBeNull]
+    public virtual string Name { get; set; }
+
+    [CanBeNull]
+    public virtual string Surname { get; set; }
+
     public virtual string Email { get; protected internal set; }
+
+    [DisableAuditing]
+    public virtual string NormalizedEmail { get; protected internal set; }
+
+    public virtual bool EmailConfirmed { get; protected internal set; }
+
+    [DisableAuditing]
+    public virtual string PasswordHash { get; protected internal set; }
+
+    [DisableAuditing]
+    public virtual string SecurityStamp { get; protected internal set; }
+
+    public virtual bool IsExternal { get; set; }
+
+    [CanBeNull]
+    public virtual string PhoneNumber { get; protected internal set; }
+
+    public virtual bool PhoneNumberConfirmed { get; protected internal set; }
     public virtual bool IsActive { get; protected internal set; }
     public virtual bool TwoFactorEnabled { get; protected internal set; }
+    public virtual DateTimeOffset? LockoutEnd { get; protected internal set; }
+    public virtual bool LockoutEnabled { get; protected internal set; }
+    public virtual int AccessFailedCount { get; protected internal set; }
     public virtual bool ShouldChangePasswordOnNextLogin { get; protected internal set; }
+    public virtual int EntityVersion { get; protected set; }
     public virtual DateTimeOffset? LastPasswordChangeTime { get; protected set; }
     public virtual DateTimeOffset? LastSignInTime { get; protected set; }
-    public virtual bool IsExternal { get; set; }
+    public virtual bool Leaved { get; protected set; }
 
     // Owned collections — loaded via includes
     public virtual ICollection<IdentityUserRole> Roles { get; protected set; }
@@ -71,13 +103,17 @@ public class IdentityUser : FullAuditedAggregateRoot<Guid>, IUser, IHasEntityVer
 Key domain behaviors on the aggregate (no direct `DbContext` calls):
 
 - `AddRole(Guid roleId)` / `RemoveRole` / `IsInRole` — mutates the `Roles` collection
-- `AddClaim(IGuidGenerator, Claim)` — ID generation stays inside the aggregate
-- `AddOrganizationUnit(Guid)` — links OU membership
-- `AddPasskey(byte[] credentialId, IdentityPasskeyData)` — WebAuthn passkey support
+- `AddClaim(IGuidGenerator, Claim)` / `AddClaims` / `ReplaceClaim` / `RemoveClaim` — ID generation stays inside the aggregate
+- `AddLogin(UserLoginInfo)` / `RemoveLogin` — external login provider associations
+- `SetToken` / `FindToken` / `RemoveToken` — per-provider authentication tokens
+- `AddOrganizationUnit(Guid)` / `RemoveOrganizationUnit` / `IsInOrganizationUnit` — OU membership
+- `AddPasswordHistory(string)` — previous password hash for password-reuse policy
+- `AddPasskey(byte[] credentialId, IdentityPasskeyData)` / `FindPasskey` / `RemovePasskey` — WebAuthn FIDO2 credential support
 - `SetLeaved(bool)` — marks user as having left a tenant without deleting the record
+- `SetIsActive`, `SetShouldChangePasswordOnNextLogin`, `SetLastPasswordChangeTime`, `SetLastSignInTime` — guarded setters for protected properties
 
 <Note>
-Properties like `PasswordHash`, `SecurityStamp`, and `NormalizedUserName` carry `[DisableAuditing]` to prevent them from appearing in audit trails.
+Properties like `PasswordHash`, `SecurityStamp`, `NormalizedUserName`, and `NormalizedEmail` carry `[DisableAuditing]` to prevent them from appearing in audit trails.
 </Note>
 
 ### IdentityRole
@@ -85,15 +121,22 @@ Properties like `PasswordHash`, `SecurityStamp`, and `NormalizedUserName` carry 
 ```csharp
 public class IdentityRole : AggregateRoot<Guid>, IMultiTenant, IHasEntityVersion, IHasCreationTime
 {
+    public virtual Guid? TenantId { get; protected set; }
     public virtual string Name { get; protected internal set; }
+
+    [DisableAuditing]
+    public virtual string NormalizedName { get; protected internal set; }
+
     public virtual bool IsDefault { get; set; }   // auto-assigned to new users
     public virtual bool IsStatic { get; set; }    // cannot be deleted/renamed
     public virtual bool IsPublic { get; set; }    // visible to other users
+    public virtual int EntityVersion { get; protected set; }
+    public virtual DateTime CreationTime { get; protected set; }
     public virtual ICollection<IdentityRoleClaim> Claims { get; protected set; }
 }
 ```
 
-`ChangeName` publishes both a local event (`IdentityRoleNameChangedEvent`) and a distributed ETO (`IdentityRoleNameChangedEto`) so other services can react without coupling.
+`ChangeName` adds both a local event (`IdentityRoleNameChangedEvent`) and a distributed ETO (`IdentityRoleNameChangedEto`) so other services can react without coupling.
 
 ### OrganizationUnit
 
@@ -163,6 +206,14 @@ CRUD for custom claim type definitions; validates that claim type names are uniq
 
 Writes `IdentitySecurityLog` entries. Configured via `AbpSecurityLogOptions`. The default store persists to the same DB as the Identity tables.
 
+### IdentityLinkUserManager
+
+Manages cross-tenant and cross-provider user account linking. Allows a user to be linked to multiple accounts (e.g., the same person across different tenants).
+
+### IdentityUserDelegationManager
+
+Creates and revokes `IdentityUserDelegation` records, which allow one user to act on behalf of another for a specified time window.
+
 ## Application Services
 
 <CardGroup cols={2}>
@@ -204,7 +255,7 @@ All controllers live under the `identity` remote service area:
 | `PUT` | `/api/identity/roles/{id}` | Update role |
 | `DELETE` | `/api/identity/roles/{id}` | Delete role |
 
-`IdentityUserIntegrationController` under `/api/identity/integration/users` exposes internal look-up endpoints consumed by other ABP modules (e.g., Permission Management) rather than by the end-user UI.
+`IdentityUserIntegrationController` under `/integration-api/identity/users` exposes internal look-up endpoints consumed by other ABP modules (e.g., Permission Management) rather than by the end-user UI. It uses a separate route prefix (`integration-api`) to allow different authorization policies from the public API.
 
 ## Module Dependencies
 
@@ -246,4 +297,4 @@ Implement `IExternalLoginProvider` (or `IExternalLoginProviderWithPassword` for 
 
 ### Dynamic Claims
 
-`IdentityDynamicClaimsPrincipalContributor` reads live role/claim data from the database and injects them into the `ClaimsPrincipal` at request time, bypassing stale cookie claims. Results are cached via `IdentityDynamicClaimsPrincipalContributorCache` (invalidated on user update).
+`IdentityDynamicClaimsPrincipalContributor` reads live role/claim data from the database and injects them into the `ClaimsPrincipal` at request time, bypassing stale cookie claims. Results are cached via `IdentityDynamicClaimsPrincipalContributorCache` (invalidated on user update via `UserEntityUpdatedOrDeletedEventHandler`).

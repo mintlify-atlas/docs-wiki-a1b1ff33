@@ -10,25 +10,26 @@ ABP's EF Core integration is built on top of `AbpDbContext<TDbContext>`, a gener
 
 <CardGroup cols={2}>
   <Card title="AbpDbContext&lt;TDbContext&gt;" icon="database">
-    The base class for all ABP EF Core DbContexts. Implements `IAbpEfCoreDbContext` and `ITransientDependency`. Registered as transient so each UoW gets its own instance.
+    The base class for all ABP EF Core DbContexts. Implements `IAbpEfCoreDbContext`, `IAbpEfCoreDbFunctionContext`, and `ITransientDependency`. Registered as transient so each UoW gets its own instance.
   </Card>
   <Card title="IAbpEfCoreDbContext" icon="plug">
-    Minimal interface (`IEfCoreDbContext` + `Initialize`). Consumed by repositories and the UoW database-API layer. Keeps coupling to the concrete type out of infrastructure code.
+    Extends `IEfCoreDbContext` and adds `Initialize(AbpEfCoreDbContextInitializationContext)`. Consumed by repositories and the UoW database-API layer to keep coupling to the concrete type out of infrastructure code.
   </Card>
   <Card title="IDbContextProvider&lt;T&gt;" icon="link">
     Resolves the correct `TDbContext` for the current UoW and tenant. The implementation `UnitOfWorkDbContextProvider` registers the DbContext as a DatabaseApi inside the active UoW.
   </Card>
   <Card title="AbpDbContextOptions" icon="sliders">
-    Options registered via `Configure&lt;AbpDbContextOptions&gt;`. Supports `DefaultOnModelCreatingAction`, per-context `OnModelCreatingActions`, `DefaultOnConfiguringAction`, and convention actions.
+    Options registered via `Configure&lt;AbpDbContextOptions&gt;`. Supports `DefaultOnModelCreatingAction`, per-context `OnModelCreatingActions`, `DefaultOnConfiguringAction`, convention actions, and more.
   </Card>
 </CardGroup>
 
 ## `AbpDbContext<TDbContext>` Lazy Services
 
-All ABP services on `AbpDbContext` are resolved lazily to avoid circular dependency issues at DbContext construction time:
+All ABP services on `AbpDbContext` are resolved lazily via `IAbpLazyServiceProvider` to avoid circular dependency issues at DbContext construction time. The class declaration and key lazy properties (from `Volo.Abp.EntityFrameworkCore/Volo/Abp/EntityFrameworkCore/AbpDbContext.cs`):
 
 ```csharp
-public abstract class AbpDbContext<TDbContext> : DbContext, IAbpEfCoreDbContext, ITransientDependency
+public abstract class AbpDbContext<TDbContext>
+    : DbContext, IAbpEfCoreDbContext, IAbpEfCoreDbFunctionContext, ITransientDependency
     where TDbContext : DbContext
 {
     public IAbpLazyServiceProvider LazyServiceProvider { get; set; } = default!;
@@ -45,7 +46,19 @@ public abstract class AbpDbContext<TDbContext> : DbContext, IAbpEfCoreDbContext,
     public IGuidGenerator GuidGenerator =>
         LazyServiceProvider.LazyGetService<IGuidGenerator>(SimpleGuidGenerator.Instance);
 
-    // ... AuditPropertySetter, EntityHistoryHelper, DistributedEventBus, LocalEventBus, etc.
+    public IAuditPropertySetter AuditPropertySetter =>
+        LazyServiceProvider.LazyGetRequiredService<IAuditPropertySetter>();
+
+    public IEntityHistoryHelper EntityHistoryHelper =>
+        LazyServiceProvider.LazyGetService<IEntityHistoryHelper>(NullEntityHistoryHelper.Instance);
+
+    public IDistributedEventBus DistributedEventBus =>
+        LazyServiceProvider.LazyGetRequiredService<IDistributedEventBus>();
+
+    public ILocalEventBus LocalEventBus =>
+        LazyServiceProvider.LazyGetRequiredService<ILocalEventBus>();
+
+    protected virtual Guid? CurrentTenantId => CurrentTenant?.Id;
 
     protected virtual bool IsMultiTenantFilterEnabled =>
         DataFilter?.IsEnabled<IMultiTenant>() ?? false;
@@ -55,9 +68,11 @@ public abstract class AbpDbContext<TDbContext> : DbContext, IAbpEfCoreDbContext,
 }
 ```
 
+`IAbpEfCoreDbFunctionContext` is implemented to support the DB-function path for global filters (see below).
+
 ## Global Query Filters
 
-ABP automatically installs EF Core [global query filters](https://learn.microsoft.com/en-us/ef/core/querying/filters) for soft-delete (`ISoftDelete`) and multi-tenancy (`IMultiTenant`) during `OnModelCreating`. The logic lives in `ConfigureBaseProperties<TEntity>`, called reflectively for every entity type:
+ABP automatically installs EF Core [global query filters](https://learn.microsoft.com/en-us/ef/core/querying/filters) for soft-delete (`ISoftDelete`) and multi-tenancy (`IMultiTenant`) during `OnModelCreating`. The logic lives in `CreateFilterExpression<TEntity>`, called reflectively via `ConfigureEntityTypeProperties` for every entity type in the model:
 
 ```csharp
 protected virtual Expression<Func<TEntity, bool>>? CreateFilterExpression<TEntity>(
@@ -78,9 +93,11 @@ protected virtual Expression<Func<TEntity, bool>>? CreateFilterExpression<TEntit
 
         if (UseDbFunction())
         {
-            // delegate to a mapped SQL scalar for compiled-query cache stability
             expression = e => AbpEfCoreDataFilterDbFunctionMethods.SoftDeleteFilter(
                 ((ISoftDelete)e).IsDeleted, true);
+            modelBuilder.ConfigureSoftDeleteDbFunction(
+                AbpEfCoreDataFilterDbFunctionMethods.SoftDeleteFilterMethodInfo,
+                this.GetService<AbpEfCoreCurrentDbContext>());
         }
     }
 
@@ -98,6 +115,9 @@ protected virtual Expression<Func<TEntity, bool>>? CreateFilterExpression<TEntit
         {
             multiTenantFilter = e => AbpEfCoreDataFilterDbFunctionMethods.MultiTenantFilter(
                 ((IMultiTenant)e).TenantId, CurrentTenantId, true);
+            modelBuilder.ConfigureMultiTenantDbFunction(
+                AbpEfCoreDataFilterDbFunctionMethods.MultiTenantFilterMethodInfo,
+                this.GetService<AbpEfCoreCurrentDbContext>());
         }
 
         expression = expression == null
@@ -111,41 +131,35 @@ protected virtual Expression<Func<TEntity, bool>>? CreateFilterExpression<TEntit
 
 The filter expressions reference instance properties (`IsSoftDeleteFilterEnabled`, `IsMultiTenantFilterEnabled`, `CurrentTenantId`) so they re-evaluate on every query without rebuilding the model. Disabling a filter via `IDataFilter.Disable<ISoftDelete>()` causes `IsSoftDeleteFilterEnabled` to return `false` for the duration of the async scope, and EF Core's parameterized filter picks this up immediately.
 
-### `AbpEfCoreCurrentDbContext` and DB Functions
-
-When `AbpEfCoreGlobalFilterOptions.UseDbFunction` is `true`, filter expressions are mapped to database scalar functions (`SoftDeleteFilter`, `MultiTenantFilter`). `AbpEfCoreCurrentDbContext` is an `AsyncLocal`-backed ambient that tracks the current `IAbpEfCoreDbFunctionContext`, allowing the mapped SQL function to read the filter state from the DbContext at query time rather than capturing a closure.
+`UseDbFunction()` returns `true` only when `AbpEfCoreGlobalFilterOptions.UseDbFunction` is set **and** `DbContextOptions` contains `AbpDbContextOptionsExtension` (i.e., a relational provider with ABP conventions applied):
 
 ```csharp
-public class AbpEfCoreCurrentDbContext
+public virtual bool UseDbFunction()
 {
-    private readonly AsyncLocal<IAbpEfCoreDbFunctionContext?> _current =
-        new AsyncLocal<IAbpEfCoreDbFunctionContext?>();
-
-    public IAbpEfCoreDbFunctionContext? Context => _current.Value;
-
-    public IDisposable Use(IAbpEfCoreDbFunctionContext? context)
-    {
-        var previousValue = Context;
-        _current.Value = context;
-        return new DisposeAction(() => { _current.Value = previousValue; });
-    }
+    return LazyServiceProvider != null
+        && GlobalFilterOptions.Value.UseDbFunction
+        && DbContextOptions.FindExtension<AbpDbContextOptionsExtension>() != null;
 }
 ```
 
+### `AbpEfCoreCurrentDbContext` and DB Functions
+
+When `UseDbFunction` is `true`, filter expressions are mapped to database scalar functions (`SoftDeleteFilter`, `MultiTenantFilter`). `AbpEfCoreCurrentDbContext` is an `AsyncLocal`-backed ambient that tracks the current `IAbpEfCoreDbFunctionContext`, allowing the mapped SQL function to read the filter state from the DbContext at query time rather than capturing a closure.
+
 <Note>
-The DB-function approach improves compiled query cache hit rates, but requires a relational provider. Non-relational EF Core providers fall back to the inline lambda expression approach automatically via `UseDbFunction()`.
+The DB-function approach improves compiled query cache hit rates, but requires a relational provider with `AbpDbContextOptionsExtension`. Non-relational EF Core providers fall back to the inline lambda expression approach automatically.
 </Note>
 
 ## SaveChanges Lifecycle
 
-`AbpDbContext` overrides `SaveChangesAsync` to inject ABP concerns around the base EF Core call:
+`AbpDbContext` overrides `SaveChangesAsync(bool, CancellationToken)` to inject ABP concerns around the base EF Core call:
 
 <Steps>
   <Step title="Publish navigation-change events">
-    `PublishEventsForChangedEntityOnSaveChangeAsync` inspects entries tracked by `AbpEfCoreNavigationHelper`. If navigation properties changed on otherwise-unchanged aggregate roots, `EntityChangeEventHelper.PublishEntityUpdatedEvent` is called.
+    `PublishEventsForChangedEntityOnSaveChangeAsync` inspects entries tracked by `AbpEfCoreNavigationHelper`. If navigation properties changed on otherwise-unchanged entities, `EntityChangeEventHelper.PublishEntityUpdatedEvent` or `PublishEntityDeletedEvent` is called based on the entity's soft-delete state.
   </Step>
   <Step title="Initialize audit log entity-change list">
-    If an active audit log exists, `EntityHistoryHelper.CreateChangeList` captures the state of all tracked entries before save.
+    If an active audit log exists (`AuditingManager.Current?.Log != null`), `EntityHistoryHelper.CreateChangeList` captures the state of all tracked entries before save.
   </Step>
   <Step title="Handle properties before save">
     `HandlePropertiesBeforeSave` iterates entries to update concurrency stamps and serialize extra properties back to their mapped columns.
@@ -154,13 +168,13 @@ The DB-function approach improves compiled query cache hit rates, but requires a
     `CreateEventReport` drains `IGeneratesDomainEvents.GetLocalEvents()` and `GetDistributedEvents()` from every tracked entity, building an `EntityEventReport`.
   </Step>
   <Step title="base.SaveChangesAsync">
-    The real EF Core `SaveChangesAsync` is called. Concurrency exceptions are re-thrown as `AbpDbConcurrencyException`.
+    The real EF Core `SaveChangesAsync` is called. `DbUpdateConcurrencyException` is caught and re-thrown as `AbpDbConcurrencyException`.
   </Step>
   <Step title="Publish entity events">
     `PublishEntityEvents` pushes drained events into the active UoW via `UnitOfWorkManager.Current?.AddOrReplaceLocalEvent` and `AddOrReplaceDistributedEvent`. These are held until the UoW commits.
   </Step>
   <Step title="Update audit log">
-    `EntityHistoryHelper.UpdateChangeList` enriches the captured change list with generated keys and final property values.
+    `EntityHistoryHelper.UpdateChangeList` enriches the captured change list with generated keys and final property values, then appends to `auditLog.EntityChanges`.
   </Step>
 </Steps>
 
@@ -171,7 +185,9 @@ The DB-function approach improves compiled query cache hit rates, but requires a
 ```csharp
 public virtual void Initialize(AbpEfCoreDbContextInitializationContext initializationContext)
 {
-    if (initializationContext.UnitOfWork.Options.Timeout.HasValue && Database.IsRelational())
+    if (initializationContext.UnitOfWork.Options.Timeout.HasValue &&
+        Database.IsRelational() &&
+        !Database.GetCommandTimeout().HasValue)
     {
         Database.SetCommandTimeout(
             TimeSpan.FromMilliseconds(initializationContext.UnitOfWork.Options.Timeout.Value));
@@ -187,6 +203,8 @@ public virtual void Initialize(AbpEfCoreDbContextInitializationContext initializ
     }
 }
 ```
+
+The timeout is only applied if no explicit command timeout was already set via `DbContextOptions`. `ChangeTracker_Tracked` and `ChangeTracker_StateChanged` feed into `AbpEfCoreNavigationHelper` and the navigation-change event pipeline.
 
 ## Multi-Database Support
 
@@ -271,13 +289,15 @@ Key design decisions:
 
 ## Entity Type Configuration
 
-`OnModelCreating` delegates to per-type helpers via reflection:
+`OnModelCreating` delegates to per-type helpers via reflection through `ConfigureEntityTypeProperties`:
 
 | Helper method | Purpose |
 |---|---|
 | `ConfigureBaseProperties<TEntity>` | Applies global filters, sets `ValueGeneratedNever` for `Guid` primary keys, configures soft-delete shadow property |
 | `ConfigureValueConverter<TEntity>` | Registers ABP value converters (e.g. `AbpJsonValueConverter` for extra properties) |
 | `ConfigureValueGenerated<TEntity>` | Marks `IEntity<Guid>.Id` as `ValueGeneratedNever` unless `[DatabaseGenerated]` overrides it |
+
+`OnConfiguring` applies `DefaultOnConfiguringAction` and per-context `OnConfiguringActions` from `AbpDbContextOptions`. `ConfigureConventions` similarly applies `DefaultConventionAction` and per-context `ConventionActions`, giving modules a hook into EF Core 7+ convention configuration without subclassing the DbContext.
 
 <Warning>
 Because `ConfigureBaseProperties` is called reflectively using `MakeGenericMethod`, any entity type that appears in the EF Core model will have these conventions applied — including owned entity types. Ensure owned types that are not aggregates do not accidentally implement `ISoftDelete` or `IMultiTenant` unless that is intentional.

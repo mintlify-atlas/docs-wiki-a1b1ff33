@@ -162,13 +162,25 @@ Reads from `IConfiguration["FeatureManagement:Features:<FeatureName>"]` — usef
 ```csharp
 public interface IFeatureManager
 {
-    Task<string> GetOrNullAsync(string name, string providerName, string providerKey);
-    Task<List<FeatureNameValue>> GetAllAsync(string providerName, string providerKey);
+    Task<string> GetOrNullAsync(string name, string providerName, string providerKey, bool fallback = true);
 
-    Task SetAsync(string name, string value, string providerName, string providerKey);
+    Task<List<FeatureNameValue>> GetAllAsync(string providerName, string providerKey, bool fallback = true);
+
+    Task<FeatureNameValueWithGrantedProvider> GetOrNullWithProviderAsync(
+        string name, string providerName, string providerKey, bool fallback = true);
+
+    Task<List<FeatureNameValueWithGrantedProvider>> GetAllWithProviderAsync(
+        string providerName, string providerKey, bool fallback = true);
+
+    Task SetAsync(string name, string value, string providerName, string providerKey, bool forceToSet = false);
+
     Task DeleteAsync(string providerName, string providerKey);
 }
 ```
+
+- `fallback = true` walks down the provider chain if the requested scope has no value, returning the effective value instead of null.
+- `forceToSet = false` (default) skips writing when the value would be identical to the inherited default.
+- `GetOrNullWithProviderAsync` / `GetAllWithProviderAsync` return `FeatureNameValueWithGrantedProvider` which includes which provider in the chain actually provided the value.
 
 Extension methods in `TenantFeatureManagerExtensions` and `EditionFeatureManagerExtensions` provide scope-specific wrappers:
 

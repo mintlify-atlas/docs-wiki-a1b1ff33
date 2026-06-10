@@ -8,10 +8,9 @@ ABP's dependency injection layer sits on top of `Microsoft.Extensions.Dependency
 
 ## The `IConventionalRegistrar` Contract
 
-The base contract has three methods, moving from coarse to fine:
+The base contract (`Volo.Abp.Core/Volo/Abp/DependencyInjection/IConventionalRegistrar.cs`) has three methods, moving from coarse to fine:
 
 ```csharp
-// IConventionalRegistrar.cs
 public interface IConventionalRegistrar
 {
     void AddAssembly(IServiceCollection services, Assembly assembly);
@@ -20,14 +19,15 @@ public interface IConventionalRegistrar
 }
 ```
 
-`ConventionalRegistrarBase` implements `AddAssembly` (which filters for concrete non-abstract non-generic classes and calls `AddTypes`) and `AddTypes` (which loops over types calling `AddType`). The only abstract member is `AddType` — subclasses implement the actual registration logic there.
+`ConventionalRegistrarBase` (`Volo.Abp.Core/Volo/Abp/DependencyInjection/ConventionalRegistrarBase.cs`) implements `AddAssembly` and `AddTypes`; the only abstract member is `AddType`. `AddAssembly` filters for concrete non-abstract non-generic classes using `AssemblyHelper.GetAllTypes` and handles `ReflectionTypeLoadException` gracefully — partial type loads are logged and the successfully-loaded types are still processed.
 
 ABP ships one concrete registrar: `DefaultConventionalRegistrar`.
 
 ## `DefaultConventionalRegistrar`
 
+`Volo.Abp.Core/Volo/Abp/DependencyInjection/DefaultConventionalRegistrar.cs`:
+
 ```csharp
-// DefaultConventionalRegistrar.cs
 public class DefaultConventionalRegistrar : ConventionalRegistrarBase
 {
     public override void AddType(IServiceCollection services, Type type)
@@ -53,6 +53,10 @@ public class DefaultConventionalRegistrar : ConventionalRegistrarBase
 
         foreach (var exposedServiceType in exposedServiceAndKeyedServiceTypes)
         {
+            var allExposingServiceTypes = exposedServiceType.ServiceKey == null
+                ? exposedServiceAndKeyedServiceTypes.Where(x => x.ServiceKey == null).ToList()
+                : exposedServiceAndKeyedServiceTypes.Where(x => x.ServiceKey?.ToString() == exposedServiceType.ServiceKey?.ToString()).ToList();
+
             var serviceDescriptor = CreateServiceDescriptor(
                 type,
                 exposedServiceType.ServiceKey,
@@ -77,32 +81,35 @@ public class DefaultConventionalRegistrar : ConventionalRegistrarBase
 `ConventionalRegistrarBase.GetLifeTimeOrNull` checks three sources in order:
 
 ```csharp
-protected virtual ServiceLifetime? GetLifeTimeOrNull(Type type, DependencyAttribute? dependencyAttribute)
+protected virtual ServiceLifetime? GetLifeTimeOrNull(
+    Type type, DependencyAttribute? dependencyAttribute)
 {
     return dependencyAttribute?.Lifetime
         ?? GetServiceLifetimeFromClassHierarchy(type)
-        ?? GetDefaultLifeTimeOrNull(type);  // returns null by default
+        ?? GetDefaultLifeTimeOrNull(type);  // returns null in base
 }
 ```
 
-1. **`[Dependency(Lifetime = …)]` attribute** — highest priority, explicit override
-2. **Marker interface** — `ITransientDependency`, `ISingletonDependency`, `IScopedDependency`
-3. **`GetDefaultLifeTimeOrNull`** — override point in custom registrars; base returns `null`
+| Priority | Source | Example |
+|---|---|---|
+| 1 (highest) | `[Dependency(Lifetime = …)]` attribute | `[Dependency(ServiceLifetime.Singleton)]` |
+| 2 | Marker interface | `: ITransientDependency` |
+| 3 | `GetDefaultLifeTimeOrNull` override | Custom registrar subclass |
 
 If all three return `null`, the type is **not registered** at all.
 
 ## Marker Interfaces
 
-The three marker interfaces are empty; their sole purpose is to trigger lifetime assignment:
+The three marker interfaces are empty; their sole purpose is to signal a lifetime:
 
 ```csharp
-// ISingletonDependency.cs
-public interface ISingletonDependency { }
-
-// ITransientDependency.cs
+// Volo.Abp.Core/Volo/Abp/DependencyInjection/ITransientDependency.cs
 public interface ITransientDependency { }
 
-// IScopedDependency.cs
+// Volo.Abp.Core/Volo/Abp/DependencyInjection/ISingletonDependency.cs
+public interface ISingletonDependency { }
+
+// Volo.Abp.Core/Volo/Abp/DependencyInjection/IScopedDependency.cs
 public interface IScopedDependency { }
 ```
 
@@ -125,15 +132,14 @@ protected virtual ServiceLifetime? GetServiceLifetimeFromClassHierarchy(Type typ
 ```
 
 <Note>
-`ITransientDependency` is checked first. If a type somehow implements both `ITransientDependency` and `ISingletonDependency`, it will be registered as transient.
+`ITransientDependency` is checked first. If a type implements both `ITransientDependency` and `ISingletonDependency`, it will be registered as transient.
 </Note>
 
 ## `DependencyAttribute` — Explicit Control
 
-`DependencyAttribute` provides fine-grained control beyond lifetime:
+`DependencyAttribute` (`Volo.Abp.Core/Volo/Abp/DependencyInjection/DependencyAttribute.cs`) provides fine-grained control:
 
 ```csharp
-// DependencyAttribute.cs
 public class DependencyAttribute : Attribute
 {
     public virtual ServiceLifetime? Lifetime { get; set; }
@@ -155,15 +161,32 @@ public class DependencyAttribute : Attribute
 
 ```csharp
 [Dependency(ReplaceServices = true)]
-public class MyEmailSender : IEmailSender, ITransientDependency { ... }
+public class MyEmailSender : IEmailSender, ITransientDependency { }
 ```
 
-## `ExposeServicesAttribute` — Controlling Which Interfaces Are Registered
+## Exposed Service Discovery
 
-By default, `ExposedServiceExplorer.GetExposedServices` applies a naming convention: if a class `FooService` implements an interface `IFooService`, the interface is exposed. `ExposeServicesAttribute` lets you declare this explicitly or override it:
+### Default Convention
+
+When no `[ExposeServices]` attribute is present, `ExposedServiceExplorer.GetExposedServices`
+(`Volo.Abp.Core/Volo/Abp/DependencyInjection/ExposedServiceExplorer.cs`) falls back to a default `ExposeServicesAttribute` with `IncludeDefaults = true` and `IncludeSelf = true`:
 
 ```csharp
-// ExposeServicesAttribute.cs
+private static readonly ExposeServicesAttribute DefaultExposeServicesAttribute =
+    new ExposeServicesAttribute
+    {
+        IncludeDefaults = true,
+        IncludeSelf = true
+    };
+```
+
+This means: register the concrete class itself **plus** any interface whose name matches the class name by the stripping convention (`IFooService` → `FooService`).
+
+### `ExposeServicesAttribute`
+
+`Volo.Abp.Core/Volo/Abp/DependencyInjection/ExposeServicesAttribute.cs`:
+
+```csharp
 [AttributeUsage(AttributeTargets.Class, AllowMultiple = true)]
 public class ExposeServicesAttribute : Attribute, IExposedServiceTypesProvider
 {
@@ -195,70 +218,102 @@ public class ExposeServicesAttribute : Attribute, IExposedServiceTypesProvider
 
         return serviceList.ToArray();
     }
-
-    private static List<Type> GetDefaultServices(Type type)
-    {
-        // Matches IFooService for FooService, IGenericService<T> for GenericService<T>, etc.
-        var serviceTypes = new List<Type>();
-        foreach (var interfaceType in type.GetTypeInfo().GetInterfaces())
-        {
-            var interfaceName = interfaceType.IsGenericType
-                ? interfaceType.Name.Left(interfaceType.Name.IndexOf('`'))
-                : interfaceType.Name;
-
-            if (interfaceName.StartsWith("I"))
-                interfaceName = interfaceName.Right(interfaceName.Length - 1);
-
-            if (type.Name.EndsWith(interfaceName, StringComparison.OrdinalIgnoreCase))
-                serviceTypes.Add(interfaceType);
-        }
-        return serviceTypes;
-    }
 }
 ```
+
+The naming convention in `GetDefaultServices` strips a leading `I` from an interface name and checks whether the class name ends with the result (case-insensitive). For generic interfaces, only the base name before the backtick is used.
 
 **Examples:**
 
 ```csharp
-// Expose only IMyService (suppress convention matching)
+// Expose only IMyService (suppress default convention)
 [ExposeServices(typeof(IMyService))]
 public class MyService : IMyService, ITransientDependency { }
 
 // Expose convention-matched interfaces AND the concrete type
 [ExposeServices(IncludeDefaults = true, IncludeSelf = true)]
 public class MyService : IMyService, ITransientDependency { }
+
+// Expose a specific set of types plus convention defaults
+[ExposeServices(typeof(ISpecialService), IncludeDefaults = true)]
+public class MyService : IMyService, ISpecialService, ITransientDependency { }
 ```
 
-## Singleton/Scoped Redirect Descriptors
+### `ExposeKeyedServiceAttribute<TServiceType>` — Keyed Services
 
-When a type is registered under multiple service keys (e.g., both `IMyService` and `MyService`) with a Singleton or Scoped lifetime, ABP creates **redirect descriptors** for all but one registration. This ensures all keys resolve to the **same instance** rather than creating duplicate objects:
+For .NET 8+ keyed DI, use `ExposeKeyedServiceAttribute<TServiceType>`:
 
 ```csharp
-// ConventionalRegistrarBase.CreateServiceDescriptor (redirect path)
-if (lifeTime.IsIn(ServiceLifetime.Singleton, ServiceLifetime.Scoped))
+// Volo.Abp.Core/Volo/Abp/DependencyInjection/ExposeKeyedServiceAttribute.cs
+[AttributeUsage(AttributeTargets.Class, AllowMultiple = true)]
+public class ExposeKeyedServiceAttribute<TServiceType> : Attribute, IExposedKeyedServiceTypesProvider
+    where TServiceType : class
 {
-    var redirectedType = GetRedirectedTypeOrNull(
-        implementationType, exposingServiceType, allExposingServiceTypes);
+    public ServiceIdentifier ServiceIdentifier { get; }
 
-    if (redirectedType != null)
+    public ExposeKeyedServiceAttribute(object serviceKey)
     {
-        return ServiceDescriptor.Describe(
-            exposingServiceType,
-            provider => provider.GetService(redirectedType)!,
-            lifeTime
-        );
+        ServiceIdentifier = new ServiceIdentifier(serviceKey, typeof(TServiceType));
+    }
+
+    public ServiceIdentifier[] GetExposedServiceTypes(Type targetType)
+    {
+        return new[] { ServiceIdentifier };
     }
 }
 ```
 
+When a type has `IExposedKeyedServiceTypesProvider` attributes but **no** `IExposedServiceTypesProvider` attributes, `ExposedServiceExplorer.GetExposedServices` returns an empty list — preventing the default convention from also adding unkeyed registrations.
+
+## Singleton/Scoped Redirect Descriptors
+
+When a type is registered under multiple service types with a `Singleton` or `Scoped` lifetime, ABP creates **redirect descriptors** for all service types except one. This ensures all registrations resolve to the **same instance** rather than creating separate objects. The redirect target is determined by `GetRedirectedTypeOrNull`:
+
+```csharp
+// ConventionalRegistrarBase.cs
+protected virtual ServiceDescriptor CreateServiceDescriptor(
+    Type implementationType,
+    object? serviceKey,
+    Type exposingServiceType,
+    List<ServiceIdentifier> allExposingServiceTypes,
+    ServiceLifetime lifeTime)
+{
+    if (lifeTime.IsIn(ServiceLifetime.Singleton, ServiceLifetime.Scoped))
+    {
+        var redirectedType = GetRedirectedTypeOrNull(
+            implementationType, exposingServiceType, allExposingServiceTypes);
+
+        if (redirectedType != null)
+        {
+            return ServiceDescriptor.Describe(
+                exposingServiceType,
+                provider => provider.GetService(redirectedType)!,
+                lifeTime
+            );
+        }
+    }
+
+    return ServiceDescriptor.Describe(exposingServiceType, implementationType, lifeTime);
+}
+```
+
+`GetRedirectedTypeOrNull` redirects to the concrete implementation type if it appears in the exposed list, otherwise to the first compatible service type in the list. No redirect is created if there is only one exposed service type, or if the current type is the implementation type itself.
+
 ## `DisableConventionalRegistrationAttribute`
 
-Placing this attribute on a class completely suppresses conventional registration for that type. It is useful for abstract helpers, base classes, or types that register themselves manually:
+Placing this attribute on a class completely suppresses conventional registration for that type:
+
+```csharp
+// Volo.Abp.Core/Volo/Abp/DependencyInjection/DisableConventionalRegistrationAttribute.cs
+public class DisableConventionalRegistrationAttribute : Attribute { }
+```
 
 ```csharp
 [DisableConventionalRegistration]
-public class MySpecialType { }
+public class MySpecialType : ISomeInterface, ITransientDependency { }
 ```
+
+This is useful for abstract helpers, base classes, or types that register themselves manually via module `ConfigureServices`.
 
 ## Assembly-Level Registration Flow
 
@@ -267,16 +322,39 @@ flowchart TD
     ASM["Assembly"] --> GAT["AssemblyHelper.GetAllTypes()"]
     GAT --> FLT["Filter: class, non-abstract, non-generic"]
     FLT --> EACH["foreach type → AddType()"]
-    EACH --> DCRA["DisableConventionalRegistration?\n→ skip"]
-    EACH --> DEPA["[Dependency] attribute?"]
-    DEPA --> LIFE["GetLifeTimeOrNull()"]
-    LIFE --> MARK["Marker interface check"]
-    MARK --> NULL{"lifetime == null?"}
-    NULL -- yes --> SKIP["Skip"]
-    NULL -- no --> EXP["GetExposedServiceTypes()"]
-    EXP --> SD["Build ServiceDescriptor(s)"]
-    SD --> REG["TryAdd / Replace / Add"]
+    EACH --> DCRA{"DisableConventionalRegistration?"}
+    DCRA -- yes --> SKIP["Skip"]
+    DCRA -- no --> DEPA["GetDependencyAttributeOrNull()"]
+    DEPA --> LIFE["GetLifeTimeOrNull():\n1. [Dependency].Lifetime\n2. Marker interface\n3. GetDefaultLifeTimeOrNull"]
+    LIFE --> NULL{"lifetime == null?"}
+    NULL -- yes --> SKIP
+    NULL -- no --> EXP["GetExposedServiceTypes() + GetExposedKeyedServiceTypes()"]
+    EXP --> TRIG["TriggerServiceExposing callbacks"]
+    TRIG --> SD["CreateServiceDescriptor (with redirect logic)"]
+    SD --> REG["TryAdd / Replace / Add → IServiceCollection"]
 ```
+
+## Custom Conventional Registrar
+
+To add a custom registrar, inherit `ConventionalRegistrarBase` and add it to `AbpConventionalRegistrarOptions`:
+
+```csharp
+public class MyConventionalRegistrar : ConventionalRegistrarBase
+{
+    public override void AddType(IServiceCollection services, Type type)
+    {
+        // custom logic — call base methods as needed
+    }
+}
+
+// In a module's ConfigureServices:
+Configure<AbpConventionalRegistrarOptions>(options =>
+{
+    options.Registrars.Add<MyConventionalRegistrar>();
+});
+```
+
+All registrars in `AbpConventionalRegistrarOptions.Registrars` are called for every `services.AddAssembly(assembly)` invocation. The default registrar is always present; custom registrars are added on top of it.
 
 ## Autofac Integration (`Volo.Abp.Autofac`)
 
@@ -285,32 +363,38 @@ ABP's default `IServiceCollection`-based DI does not support property injection 
 ### Package Module
 
 ```csharp
-// AbpAutofacModule.cs
+// Volo.Abp.Autofac/Volo/Abp/Autofac/AbpAutofacModule.cs
 [DependsOn(typeof(AbpCastleCoreModule))]
 public class AbpAutofacModule : AbpModule { }
 ```
 
-The module depends on `AbpCastleCoreModule` which provides Castle Windsor's dynamic proxy infrastructure used for interceptors.
+The module depends on `AbpCastleCoreModule`, which provides Castle Windsor's dynamic proxy infrastructure used for interceptors.
 
 ### `AbpAutofacServiceProviderFactory`
 
-Implements `IServiceProviderFactory<ContainerBuilder>`. It populates an Autofac `ContainerBuilder` from the `IServiceCollection` and builds an `AutofacServiceProvider`:
+`Volo.Abp.Autofac/Volo/Abp/Autofac/AbpAutofacServiceProviderFactory.cs` implements `IServiceProviderFactory<ContainerBuilder>`:
 
 ```csharp
-// AbpAutofacServiceProviderFactory.cs
 public class AbpAutofacServiceProviderFactory : IServiceProviderFactory<ContainerBuilder>
 {
     private readonly ContainerBuilder _builder;
+    private IServiceCollection _services = default!;
+
+    public AbpAutofacServiceProviderFactory(ContainerBuilder builder)
+    {
+        _builder = builder;
+    }
 
     public ContainerBuilder CreateBuilder(IServiceCollection services)
     {
         _services = services;
-        _builder.Populate(services);   // calls AutofacRegistration.Populate
+        _builder.Populate(services);   // transfers IServiceCollection registrations to Autofac
         return _builder;
     }
 
     public IServiceProvider CreateServiceProvider(ContainerBuilder containerBuilder)
     {
+        Check.NotNull(containerBuilder, nameof(containerBuilder));
         return new AutofacServiceProvider(containerBuilder.Build());
     }
 }
@@ -325,22 +409,28 @@ builder.UseServiceProviderFactory(
 
 ### `ConfigureAbpConventions` Extension
 
-When `AutofacRegistration.Populate` re-registers each `ServiceDescriptor`, it calls `ConfigureAbpConventions` on each registration builder:
+`Volo.Abp.Autofac/Autofac/Builder/AbpRegistrationBuilderExtensions.cs` exposes `ConfigureAbpConventions`, called during `AutofacRegistration.Populate` for each descriptor that has a reflection activator:
 
 ```csharp
-// AbpRegistrationBuilderExtensions.cs
-public static IRegistrationBuilder<...> ConfigureAbpConventions<...>(
-    this IRegistrationBuilder<...> registrationBuilder,
-    ServiceDescriptor serviceDescriptor,
-    IModuleContainer moduleContainer,
-    ServiceRegistrationActionList registrationActionList,
-    ServiceActivatedActionList activatedActionList,
-    HashSet<Assembly>? nonModuleAssemblies = null)
+public static IRegistrationBuilder<TLimit, TActivatorData, TRegistrationStyle>
+    ConfigureAbpConventions<TLimit, TActivatorData, TRegistrationStyle>(
+        this IRegistrationBuilder<TLimit, TActivatorData, TRegistrationStyle> registrationBuilder,
+        ServiceDescriptor serviceDescriptor,
+        IModuleContainer moduleContainer,
+        ServiceRegistrationActionList registrationActionList,
+        ServiceActivatedActionList activatedActionList,
+        HashSet<Assembly>? nonModuleAssemblies = null)
     where TActivatorData : ReflectionActivatorData
 {
     registrationBuilder = registrationBuilder.InvokeActivatedActions(activatedActionList, serviceDescriptor);
 
+    var serviceType = registrationBuilder.RegistrationData.Services
+        .OfType<IServiceWithType>().FirstOrDefault()?.ServiceType;
+    if (serviceType == null) return registrationBuilder;
+
     var implementationType = registrationBuilder.ActivatorData.ImplementationType;
+    if (implementationType == null) return registrationBuilder;
+
     registrationBuilder = registrationBuilder.EnablePropertyInjection(
         moduleContainer, implementationType, nonModuleAssemblies);
     registrationBuilder = registrationBuilder.InvokeRegistrationActions(
@@ -352,38 +442,26 @@ public static IRegistrationBuilder<...> ConfigureAbpConventions<...>(
 
 ### Property Injection
 
-Property injection is enabled only for types whose assembly belongs to a loaded ABP module:
+Property injection is enabled only for types whose assembly belongs to a loaded ABP module and that do not carry `[DisablePropertyInjection]` at the class level:
 
 ```csharp
-private static IRegistrationBuilder<...> EnablePropertyInjection<...>(
-    this IRegistrationBuilder<...> registrationBuilder,
-    IModuleContainer moduleContainer,
-    Type implementationType,
-    HashSet<Assembly>? nonModuleAssemblies)
-    where TActivatorData : ReflectionActivatorData
+// EnablePropertyInjection (private, in AbpRegistrationBuilderExtensions.cs)
+if (!implementationType.GetCustomAttributes(typeof(DisablePropertyInjectionAttribute), true).IsNullOrEmpty())
 {
-    if (!implementationType
-        .GetCustomAttributes(typeof(DisablePropertyInjectionAttribute), true)
-        .IsNullOrEmpty())
-    {
-        return registrationBuilder;   // [DisablePropertyInjection] on class → skip
-    }
+    return registrationBuilder;   // [DisablePropertyInjection] on class → skip
+}
 
-    if (moduleContainer.Modules.Any(m => m.AllAssemblies.Contains(implementationType.Assembly)))
-    {
-        registrationBuilder = registrationBuilder
-            .PropertiesAutowired(new AbpPropertySelector(false));
-    }
-    else
-    {
-        nonModuleAssemblies?.Add(implementationType.Assembly);
-    }
-
-    return registrationBuilder;
+if (moduleContainer.Modules.Any(m => m.AllAssemblies.Contains(implementationType.Assembly)))
+{
+    registrationBuilder = registrationBuilder.PropertiesAutowired(new AbpPropertySelector(false));
+}
+else
+{
+    nonModuleAssemblies?.Add(implementationType.Assembly);
 }
 ```
 
-`AbpPropertySelector` extends Autofac's `DefaultPropertySelector` and additionally respects `[DisablePropertyInjection]` at the property level:
+`AbpPropertySelector` (`Volo.Abp.Autofac/Volo/Abp/Autofac/AbpPropertySelector.cs`) extends Autofac's `DefaultPropertySelector` and additionally respects `[DisablePropertyInjection]` at the property level:
 
 ```csharp
 public class AbpPropertySelector : DefaultPropertySelector
@@ -400,23 +478,32 @@ public class AbpPropertySelector : DefaultPropertySelector
 }
 ```
 
+`[DisablePropertyInjection]` (`Volo.Abp.Core/Volo/Abp/DependencyInjection/DisablePropertyInjectionAttribute.cs`) targets both classes (`AttributeTargets.Class`) and properties (`AttributeTargets.Property`), so it can suppress injection at either level.
+
 <Tip>
-Decorate a property with `[DisablePropertyInjection]` to prevent Autofac from injecting it even when the class is in a module assembly. This is commonly used for properties that are set manually or that should not be resolved from the container.
+Decorate a property with `[DisablePropertyInjection]` to prevent Autofac from injecting it even when the class is in a module assembly. This is commonly used for properties that are set manually or should not be resolved from the container.
 </Tip>
 
 ### Interceptor Registration Pipeline
 
-When ABP features like auditing or validation register an interceptor, they call `OnServiceRegistredContext.Interceptors.Add<TInterceptor>()` from a `ServiceRegistrationActionList` callback. The `InvokeRegistrationActions` method fires those callbacks and, if any interceptors were collected, calls `AddInterceptors`:
+When ABP features like auditing or validation register an interceptor, they call `context.Interceptors.Add<TInterceptor>()` from a `ServiceRegistrationActionList` callback. `InvokeRegistrationActions` fires those callbacks and, if any interceptors were collected, calls `AddInterceptors`:
 
 ```csharp
-// Interface interceptors (proxy wraps the interface)
+// AddInterceptors (private, in AbpRegistrationBuilderExtensions.cs)
 if (serviceType.IsInterface)
 {
     registrationBuilder = registrationBuilder.EnableInterfaceInterceptors();
 }
 else
 {
-    // Class interceptors (requires virtual methods)
+    // Class interceptors are disabled if IsClassInterceptorsDisabled or a selector matches
+    if (serviceRegistrationActionList.IsClassInterceptorsDisabled ||
+        serviceRegistrationActionList.DisabledClassInterceptorsSelectors
+            .Any(selector => selector.Predicate(serviceType)))
+    {
+        return registrationBuilder;
+    }
+
     (registrationBuilder as IRegistrationBuilder<TLimit,
         ConcreteReflectionActivatorData, TRegistrationStyle>)
         ?.EnableClassInterceptors();
@@ -430,39 +517,28 @@ foreach (var interceptor in interceptors)
 }
 ```
 
-`AbpAsyncDeterminationInterceptor<T>` is provided by `Volo.Abp.Castle.Core` and transparently handles both sync and async method interception using Castle DynamicProxy.
+`AbpAsyncDeterminationInterceptor<T>` is provided by `Volo.Abp.Castle.Core` and transparently handles both sync and async method interception using Castle DynamicProxy. Class interceptors require virtual methods; interface interceptors do not.
 
-### Orphan Module Warning
+## Key Types Summary
 
-`AutofacRegistration.Register` collects assemblies that were excluded from property injection (not in any module's `AllAssemblies`) and, after processing all descriptors, warns about any ABP module types found in those assemblies that were not in the `[DependsOn]` chain:
-
-```csharp
-// If an assembly has services registered but its module is not in the dependency chain,
-// property injection (e.g. LazyServiceProvider) will not work for those types.
-logger.LogWarning(
-    $"Assembly '{assembly.GetName().Name}' has services registered in the DI container, " +
-    $"but its ABP module '{type.FullName}' is not in the [DependsOn] chain. ...");
-```
-
-## Custom Conventional Registrar
-
-To add a custom registrar (e.g., to register types by a different convention), inherit `ConventionalRegistrarBase` and add it to `AbpConventionalRegistrarOptions`:
-
-```csharp
-public class MyConventionalRegistrar : ConventionalRegistrarBase
-{
-    public override void AddType(IServiceCollection services, Type type)
-    {
-        // custom logic
-    }
-}
-
-// In a module's ConfigureServices:
-Configure<AbpConventionalRegistrarOptions>(options =>
-{
-    options.Registrars.Add<MyConventionalRegistrar>();
-});
-```
+| Type | File | Role |
+|---|---|---|
+| `IConventionalRegistrar` | `DependencyInjection/IConventionalRegistrar.cs` | Base contract for assembly/type scanners |
+| `ConventionalRegistrarBase` | `DependencyInjection/ConventionalRegistrarBase.cs` | `AddAssembly`/`AddTypes` implementations, redirect logic |
+| `DefaultConventionalRegistrar` | `DependencyInjection/DefaultConventionalRegistrar.cs` | Production registrar, wires lifetime + exposed types |
+| `DependencyAttribute` | `DependencyInjection/DependencyAttribute.cs` | Override lifetime, `TryRegister`, `ReplaceServices` |
+| `ExposeServicesAttribute` | `DependencyInjection/ExposeServicesAttribute.cs` | Declare which service types to register under |
+| `ExposeKeyedServiceAttribute<T>` | `DependencyInjection/ExposeKeyedServiceAttribute.cs` | Register under a keyed service |
+| `DisableConventionalRegistrationAttribute` | `DependencyInjection/DisableConventionalRegistrationAttribute.cs` | Opt out of conventional scanning |
+| `ExposedServiceExplorer` | `DependencyInjection/ExposedServiceExplorer.cs` | Resolves final set of service types for a class |
+| `ITransientDependency` | `DependencyInjection/ITransientDependency.cs` | Marker for transient lifetime |
+| `ISingletonDependency` | `DependencyInjection/ISingletonDependency.cs` | Marker for singleton lifetime |
+| `IScopedDependency` | `DependencyInjection/IScopedDependency.cs` | Marker for scoped lifetime |
+| `AbpAutofacModule` | `Volo.Abp.Autofac/Volo/Abp/Autofac/AbpAutofacModule.cs` | Entry module for Autofac integration |
+| `AbpAutofacServiceProviderFactory` | `Volo.Abp.Autofac/Volo/Abp/Autofac/AbpAutofacServiceProviderFactory.cs` | Builds Autofac container from `IServiceCollection` |
+| `AbpPropertySelector` | `Volo.Abp.Autofac/Volo/Abp/Autofac/AbpPropertySelector.cs` | Respects `[DisablePropertyInjection]` on properties |
+| `AbpRegistrationBuilderExtensions` | `Volo.Abp.Autofac/Autofac/Builder/AbpRegistrationBuilderExtensions.cs` | Property injection + interceptor wiring per registration |
+| `DisablePropertyInjectionAttribute` | `DependencyInjection/DisablePropertyInjectionAttribute.cs` | Suppress Autofac property injection on class or property |
 
 ## See Also
 

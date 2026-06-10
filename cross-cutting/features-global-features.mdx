@@ -80,7 +80,7 @@ public class FeatureChecker : FeatureCheckerBase
 }
 ```
 
-The resolution algorithm mirrors the settings chain: providers are reversed (highest priority last) and queried until a non-null value is found. The typical provider order registered by the commercial edition is:
+The resolution algorithm mirrors the settings chain: providers are reversed (highest priority last in registration order, first in iteration) and queried until a non-null value is found. The typical provider order registered by the commercial edition is:
 
 | Priority (high→low) | Provider | Scope |
 |---|---|---|
@@ -212,23 +212,42 @@ public class GlobalFeatureManager
         = new GlobalFeatureManager();
 
     protected HashSet<string> EnabledFeatures { get; }
+    public Dictionary<object, object> Configuration { get; }
     public GlobalModuleFeaturesDictionary Modules { get; }
 
     public virtual bool IsEnabled<TFeature>()
-        => IsEnabled(GlobalFeatureNameAttribute.GetName(typeof(TFeature)));
+        => IsEnabled(typeof(TFeature));
+
+    public virtual bool IsEnabled(Type featureType)
+        => IsEnabled(GlobalFeatureNameAttribute.GetName(featureType));
 
     public virtual bool IsEnabled(string featureName)
         => EnabledFeatures.Contains(featureName);
 
     public virtual void Enable<TFeature>()
-        => Enable(GlobalFeatureNameAttribute.GetName(typeof(TFeature)));
+        => Enable(typeof(TFeature));
+
+    public virtual void Enable(Type featureType)
+        => Enable(GlobalFeatureNameAttribute.GetName(featureType));
 
     public virtual void Enable(string featureName)
         => EnabledFeatures.AddIfNotContains(featureName);
+
+    public virtual void Disable<TFeature>()
+        => Disable(typeof(TFeature));
+
+    public virtual void Disable(Type featureType)
+        => Disable(GlobalFeatureNameAttribute.GetName(featureType));
+
+    public virtual void Disable(string featureName)
+        => EnabledFeatures.Remove(featureName);
+
+    public virtual IEnumerable<string> GetEnabledFeatureNames()
+        => EnabledFeatures;
 }
 ```
 
-The `GlobalFeatureNameAttribute` must be present on every global feature class — it supplies the string key used in `EnabledFeatures`. Calling `GlobalFeatureManager.GetName(type)` without the attribute throws `AbpException`.
+The `GlobalFeatureNameAttribute` must be present on every global feature class — it supplies the string key used in `EnabledFeatures`. Calling `GlobalFeatureManager.Instance.Enable(typeof(TFeature))` without the attribute throws `AbpException`.
 
 ### GlobalModuleFeatures
 

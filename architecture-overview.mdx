@@ -41,17 +41,50 @@ graph LR
 
 ## Application Variants
 
-`AbpApplicationBase` is abstract. Two concrete subclasses cover the two common hosting patterns:
+`AbpApplicationBase` (`Volo/Abp/AbpApplicationBase.cs`) is abstract (`internal` constructor). Two `internal` concrete subclasses cover the two common hosting patterns:
 
-| Subclass | `IServiceProvider` source | Typical use |
-|---|---|---|
-| `AbpApplicationWithInternalServiceProvider` | Built internally from `IServiceCollection` | Console apps, tests |
-| `AbpApplicationWithExternalServiceProvider` | Passed in from ASP.NET Core host | ASP.NET Core web apps |
+| Subclass | Interface | `IServiceProvider` source | Typical use |
+|---|---|---|---|
+| `AbpApplicationWithInternalServiceProvider` | `IAbpApplicationWithInternalServiceProvider` | Built from `IServiceCollection` via `Services.BuildServiceProviderFromFactory().CreateScope()` | Console apps, integration tests |
+| `AbpApplicationWithExternalServiceProvider` | `IAbpApplicationWithExternalServiceProvider` | Passed in by the ASP.NET Core host via `InitializeAsync(IServiceProvider)` | ASP.NET Core web apps |
 
-`AbpApplicationFactory` is the recommended entry point; it handles the `SkipConfigureServices` flag and calls `ConfigureServicesAsync` after construction so callers always get a fully configured object:
+### `IAbpApplicationWithInternalServiceProvider`
+
+Defined in `Volo/Abp/IAbpApplicationWithInternalServiceProvider.cs`:
 
 ```csharp
-// AbpApplicationFactory.cs (simplified)
+public interface IAbpApplicationWithInternalServiceProvider : IAbpApplication
+{
+    // Creates the service provider without initializing modules.
+    // Subsequent calls return the same instance.
+    IServiceProvider CreateServiceProvider();
+
+    Task InitializeAsync();   // creates SP + runs module lifecycle
+    void Initialize();        // sync equivalent
+}
+```
+
+### `IAbpApplicationWithExternalServiceProvider`
+
+Defined in `Volo/Abp/IAbpApplicationWithExternalServiceProvider.cs`:
+
+```csharp
+public interface IAbpApplicationWithExternalServiceProvider : IAbpApplication
+{
+    // Stores the provider without initializing modules.
+    void SetServiceProvider(IServiceProvider serviceProvider);
+
+    Task InitializeAsync(IServiceProvider serviceProvider);  // set + run lifecycle
+    void Initialize(IServiceProvider serviceProvider);       // sync equivalent
+}
+```
+
+### `AbpApplicationFactory` — All Overloads
+
+`AbpApplicationFactory` (`Volo/Abp/AbpApplicationFactory.cs`) is the recommended entry point. It exposes eight static methods: four synchronous `Create` variants and four asynchronous `CreateAsync` variants. The async overloads set `SkipConfigureServices = true` before passing options to the constructor, then call `ConfigureServicesAsync()` after construction:
+
+```csharp
+// AbpApplicationFactory.cs
 public async static Task<IAbpApplicationWithInternalServiceProvider> CreateAsync<TStartupModule>(
     Action<AbpApplicationCreationOptions>? optionsAction = null)
     where TStartupModule : IAbpModule
@@ -66,6 +99,8 @@ public async static Task<IAbpApplicationWithInternalServiceProvider> CreateAsync
 }
 ```
 
+The same `SkipConfigureServices = true` + `ConfigureServicesAsync()` pattern is applied by all four `CreateAsync` overloads (both `<TStartupModule>` generic and `Type startupModuleType` non-generic, for both internal and external SP variants). The four sync `Create` overloads construct directly without calling `ConfigureServicesAsync`.
+
 ## Startup Sequence
 
 ```mermaid
@@ -77,44 +112,64 @@ sequenceDiagram
     participant Reg as ConventionalRegistrar
     participant MM as ModuleManager
 
-    Host->>Factory: CreateAsync<TStartupModule>()
-    Factory->>App: new AbpApplicationBase(startupModuleType, services)
+    Host->>Factory: CreateAsync<TStartupModule>(services)
+    Factory->>App: new AbpApplicationWithExternalServiceProvider(startupModuleType, services)
+    App->>App: services.TryAddObjectAccessor<IServiceProvider>()
+    App->>App: services.AddSingleton<IAbpApplication>(this)
+    App->>App: services.AddSingleton<IApplicationInfoAccessor>(this)
+    App->>App: services.AddSingleton<IModuleContainer>(this)
+    App->>App: services.AddSingleton<IAbpHostEnvironment>(...)
     App->>App: services.AddCoreServices()
     App->>App: services.AddCoreAbpServices()
     App->>ML: LoadModules(services, startupModuleType, plugInSources)
-    ML-->>App: IAbpModuleDescriptor[] (sorted)
+    ML-->>App: IAbpModuleDescriptor[] (topologically sorted)
     Factory->>App: ConfigureServicesAsync()
     App->>App: PreConfigureServices (all modules)
     App->>Reg: AddAssembly(module.AllAssemblies) per module
     App->>App: ConfigureServices (all modules)
     App->>App: PostConfigureServices (all modules)
-    Host->>App: InitializeModulesAsync()
+    Host->>App: InitializeAsync(serviceProvider)
+    App->>App: SetServiceProvider(serviceProvider)
     App->>MM: InitializeModulesAsync(context)
-    MM->>MM: OnPreApplicationInitialization (all)
-    MM->>MM: OnApplicationInitialization (all)
-    MM->>MM: OnPostApplicationInitialization (all)
+    MM->>MM: OnPreApplicationInitialization (all modules)
+    MM->>MM: OnApplicationInitialization (all modules)
+    MM->>MM: OnPostApplicationInitialization (all modules)
 ```
 
 ### Phase 1 — Construction (`AbpApplicationBase` constructor)
 
+The constructor (`Volo/Abp/AbpApplicationBase.cs`) performs these registrations synchronously before any `ConfigureServices` call:
+
 ```csharp
-// AbpApplicationBase.cs (constructor body)
+// AbpApplicationBase.cs — constructor body
 services.TryAddObjectAccessor<IServiceProvider>();
 services.AddSingleton<IAbpApplication>(this);
 services.AddSingleton<IApplicationInfoAccessor>(this);
 services.AddSingleton<IModuleContainer>(this);
-services.AddCoreServices();          // Options, Logging, Localization
+services.AddSingleton<IAbpHostEnvironment>(new AbpHostEnvironment()
+{
+    EnvironmentName = options.Environment
+});
+
+ApplicationName = GetApplicationName(options);  // options > IConfiguration > entry assembly name
+
+services.AddCoreServices();           // Options, Logging, Localization
 services.AddCoreAbpServices(this, options);  // ModuleLoader, AssemblyFinder, lifecycle contributor wiring
+
 Modules = LoadModules(services, options);    // calls ModuleLoader
+
 if (!options.SkipConfigureServices)
 {
-    ConfigureServices();             // synchronous fast-path
+    ConfigureServices();   // sync fast-path; skipped when using CreateAsync
 }
 ```
 
-`AddCoreAbpServices` (in `InternalServiceCollectionExtensions`) is where the four default lifecycle contributors are registered against `AbpModuleLifecycleOptions`:
+`AddCoreServices` (in `Volo/Abp/Internal/InternalServiceCollectionExtensions.cs`) calls `services.AddOptions()`, `services.AddLogging()`, and `services.AddLocalization()`.
+
+`AddCoreAbpServices` (same file) registers `IModuleLoader`, `IAssemblyFinder`, `IInitLoggerFactory`, `ITypeFinder`, and the four default lifecycle contributors:
 
 ```csharp
+// InternalServiceCollectionExtensions.cs
 services.Configure<AbpModuleLifecycleOptions>(options =>
 {
     options.Contributors.Add<OnPreApplicationInitializationModuleLifecycleContributor>();
@@ -126,36 +181,52 @@ services.Configure<AbpModuleLifecycleOptions>(options =>
 
 ### Phase 2 — ConfigureServices
 
-`AbpApplicationBase.ConfigureServicesAsync` iterates `Modules` three times — Pre, Main, Post — and auto-registers assemblies between Pre and Main:
+`ConfigureServicesAsync` (`Volo/Abp/AbpApplicationBase.cs`) iterates `Modules` in three passes. Between the Pre pass and the main ConfigureServices pass, each module's assemblies are registered with the conventional registrar (unless `SkipAutoServiceRegistration` is set). A `HashSet<Assembly>` guards against double-registration when two modules share an assembly:
 
 ```csharp
+// AbpApplicationBase.ConfigureServicesAsync — abridged
+var context = new ServiceConfigurationContext(Services);
+Services.AddSingleton(context);
+
+// Inject context into every AbpModule instance (only valid during this phase)
+foreach (var module in Modules)
+    if (module.Instance is AbpModule abpModule)
+        abpModule.ServiceConfigurationContext = context;
+
 // PreConfigureServices pass
-foreach (var module in Modules.Where(m => m.Instance is IPreConfigureServices)) { ... }
+foreach (var module in Modules.Where(m => m.Instance is IPreConfigureServices))
+    await ((IPreConfigureServices)module.Instance).PreConfigureServicesAsync(context);
+
+var assemblies = new HashSet<Assembly>();
 
 // Auto-register assemblies, then ConfigureServices pass
 foreach (var module in Modules)
 {
     if (module.Instance is AbpModule abpModule && !abpModule.SkipAutoServiceRegistration)
-    {
         foreach (var assembly in module.AllAssemblies)
-        {
-            Services.AddAssembly(assembly);   // calls DefaultConventionalRegistrar
-        }
-    }
+            if (assemblies.Add(assembly))             // HashSet.Add returns false if already present
+                Services.AddAssembly(assembly);       // → DefaultConventionalRegistrar
+
     await module.Instance.ConfigureServicesAsync(context);
 }
 
 // PostConfigureServices pass
-foreach (var module in Modules.Where(m => m.Instance is IPostConfigureServices)) { ... }
+foreach (var module in Modules.Where(m => m.Instance is IPostConfigureServices))
+    await ((IPostConfigureServices)module.Instance).PostConfigureServicesAsync(context);
+
+// Nullify context — accessing it outside ConfigureServices throws AbpException
+foreach (var module in Modules)
+    if (module.Instance is AbpModule abpModule)
+        abpModule.ServiceConfigurationContext = null!;
 ```
 
 <Note>
-`ServiceConfigurationContext` is injected into each `AbpModule` instance only during the ConfigureServices phase and set to `null` afterwards. Accessing it outside that window throws `AbpException`.
+`ServiceConfigurationContext` is injected into each `AbpModule` instance only for the duration of the ConfigureServices phase and set to `null` afterwards. Accessing `ServiceConfigurationContext` outside `PreConfigureServices`, `ConfigureServices`, or `PostConfigureServices` throws `AbpException`.
 </Note>
 
 ### Phase 3 — Initialize
 
-After `IServiceProvider` is built by the host, `InitializeModulesAsync` creates a DI scope and hands it to `ModuleManager`:
+After the host builds `IServiceProvider`, the concrete application variant's `InitializeAsync` is called. For the external-SP variant this is `InitializeAsync(IServiceProvider)`, which calls `SetServiceProvider` then `InitializeModulesAsync`:
 
 ```csharp
 // AbpApplicationBase.cs
@@ -171,10 +242,19 @@ protected virtual async Task InitializeModulesAsync()
 }
 ```
 
-`ModuleManager` runs each `IModuleLifecycleContributor` over every module in dependency order:
+`WriteInitLogs` flushes all entries buffered by `IInitLoggerFactory` (used during bootstrap before a proper `ILoggerFactory` is available) into the real logger.
+
+`ModuleManager` (`Volo/Abp/Modularity/ModuleManager.cs`) resolves its lifecycle contributors from `AbpModuleLifecycleOptions` at construction time via `serviceProvider.GetRequiredService` for each contributor type, then runs them over the module list:
 
 ```csharp
-// ModuleManager.cs
+// ModuleManager.cs — constructor
+_lifecycleContributors = options.Value
+    .Contributors
+    .Select(serviceProvider.GetRequiredService)
+    .Cast<IModuleLifecycleContributor>()
+    .ToArray();
+
+// ModuleManager.InitializeModulesAsync
 public virtual async Task InitializeModulesAsync(ApplicationInitializationContext context)
 {
     foreach (var contributor in _lifecycleContributors)
@@ -184,15 +264,18 @@ public virtual async Task InitializeModulesAsync(ApplicationInitializationContex
             await contributor.InitializeAsync(context, module.Instance);
         }
     }
+    _logger.LogInformation("Initialized all ABP modules.");
 }
 ```
 
+Each contributor checks via `is` cast whether the module implements the relevant interface, so modules that do not override `OnApplicationInitialization` incur no overhead.
+
 ### Phase 4 — Shutdown
 
-Shutdown reverses the module list and drives `ShutdownModulesAsync`:
+Shutdown reverses the module list so the startup module shuts down first and its deepest dependencies last:
 
 ```csharp
-// ModuleManager.cs
+// ModuleManager.cs — ShutdownModulesAsync
 public virtual async Task ShutdownModulesAsync(ApplicationShutdownContext context)
 {
     var modules = _moduleContainer.Modules.Reverse().ToList();
@@ -202,9 +285,66 @@ public virtual async Task ShutdownModulesAsync(ApplicationShutdownContext contex
 }
 ```
 
+`AbpApplicationBase.ShutdownAsync` creates a fresh DI scope for shutdown, matching the scope created for initialization:
+
+```csharp
+// AbpApplicationBase.cs
+public virtual async Task ShutdownAsync()
+{
+    using (var scope = ServiceProvider.CreateScope())
+    {
+        await scope.ServiceProvider
+            .GetRequiredService<IModuleManager>()
+            .ShutdownModulesAsync(new ApplicationShutdownContext(scope.ServiceProvider));
+    }
+}
+```
+
+Sync equivalents (`Shutdown()`, `ShutdownModules(context)`) exist on both `IAbpApplication` and `ModuleManager` and follow the same pattern without `await`.
+
 ## Module Graph and Ordering
 
-`ModuleLoader` builds the descriptor list with `GetDescriptors`, then sorts it with `SortByDependency`:
+`ModuleLoader.LoadModules` (`Volo/Abp/Modularity/ModuleLoader.cs`) builds the descriptor list in two steps: `GetDescriptors` then `SortByDependency`.
+
+**`GetDescriptors`** calls `FillModules` (which uses `AbpModuleHelper.FindAllModuleTypes` for the static graph and iterates `PlugInSourceList` for plugins), then `SetDependencies` to wire `IAbpModuleDescriptor.Dependencies`:
+
+```csharp
+// ModuleLoader.cs
+protected virtual void FillModules(
+    List<AbpModuleDescriptor> modules,
+    IServiceCollection services,
+    Type startupModuleType,
+    PlugInSourceList plugInSources)
+{
+    // Static dependency graph
+    foreach (var moduleType in AbpModuleHelper.FindAllModuleTypes(startupModuleType, logger))
+        modules.Add(CreateModuleDescriptor(services, moduleType));
+
+    // Plugin modules (deduped against static set)
+    foreach (var moduleType in plugInSources.GetAllModules(logger))
+    {
+        if (modules.Any(m => m.Type == moduleType)) continue;
+        modules.Add(CreateModuleDescriptor(services, moduleType, isLoadedAsPlugIn: true));
+    }
+}
+```
+
+`CreateAndRegisterModule` instantiates each module via `Activator.CreateInstance` and registers it as a singleton in `IServiceCollection`, making module instances resolvable from DI.
+
+**`SortByDependency`** calls `modules.SortByDependencies(m => m.Dependencies)` (a topological sort extension using Kahn's algorithm) and then moves the startup module to the **last** position:
+
+```csharp
+// ModuleLoader.cs
+protected virtual List<IAbpModuleDescriptor> SortByDependency(
+    List<IAbpModuleDescriptor> modules, Type startupModuleType)
+{
+    var sortedModules = modules.SortByDependencies(m => m.Dependencies);
+    sortedModules.MoveItem(m => m.Type == startupModuleType, modules.Count - 1);
+    return sortedModules;
+}
+```
+
+This guarantees that a module's `ConfigureServices` and all lifecycle hooks execute **after** all of its declared dependencies.
 
 ```mermaid
 graph TD
@@ -216,7 +356,30 @@ graph TD
     style SM fill:#4F86C6,color:#fff
 ```
 
-After topological sort, the startup module is moved to the **last** position so its `ConfigureServices` and lifecycle hooks run after all dependencies. `SortByDependencies` (an extension on `IEnumerable`) implements Kahn's algorithm on `m.Dependencies`.
+After sort: `[C, A, B, StartupModule]`. Lifecycle runs left-to-right; shutdown runs right-to-left.
+
+## Lifecycle Contributor Detail
+
+The four default contributors are defined in `Volo/Abp/Modularity/DefaultModuleLifecycleContributor.cs`. Each implements `IModuleLifecycleContributor` (`Volo/Abp/Modularity/IModuleLifecycleContributor.cs`):
+
+```csharp
+public interface IModuleLifecycleContributor : ITransientDependency
+{
+    Task InitializeAsync(ApplicationInitializationContext context, IAbpModule module);
+    void Initialize(ApplicationInitializationContext context, IAbpModule module);
+    Task ShutdownAsync(ApplicationShutdownContext context, IAbpModule module);
+    void Shutdown(ApplicationShutdownContext context, IAbpModule module);
+}
+```
+
+| Contributor | Triggers when module implements |
+|---|---|
+| `OnPreApplicationInitializationModuleLifecycleContributor` | `IOnPreApplicationInitialization` |
+| `OnApplicationInitializationModuleLifecycleContributor` | `IOnApplicationInitialization` |
+| `OnPostApplicationInitializationModuleLifecycleContributor` | `IOnPostApplicationInitialization` |
+| `OnApplicationShutdownModuleLifecycleContributor` | `IOnApplicationShutdown` |
+
+Because `AbpModule` implements all four interfaces (with empty default bodies), every module participates in every phase unless `ModuleLifecycleContributorBase` short-circuits via the `is` cast. Additional contributors can be added to `AbpModuleLifecycleOptions.Contributors` from any module's `ConfigureServices`.
 
 ## DI Registration Pipeline
 
@@ -225,18 +388,45 @@ flowchart LR
     ASM["module.AllAssemblies"] --> SCAN["AssemblyHelper.GetAllTypes()"]
     SCAN --> FILTER["non-abstract, non-generic classes"]
     FILTER --> REG["IConventionalRegistrar.AddType()"]
-    REG --> LIFE["Determine Lifetime<br/>(DependencyAttribute → marker interface → default)"]
-    LIFE --> EXP["GetExposedServiceTypes()"]
+    REG --> LIFE["Determine Lifetime<br/>(DependencyAttribute → marker interface → GetDefaultLifeTimeOrNull)"]
+    LIFE --> EXP["GetExposedServiceTypes() + GetExposedKeyedServiceTypes()"]
     EXP --> SD["ServiceDescriptor → IServiceCollection"]
 ```
 
-The conventional registrar checks:
-1. `[DisableConventionalRegistration]` — skip entirely
-2. `[Dependency(Lifetime = …)]` — explicit lifetime
-3. `ITransientDependency` / `ISingletonDependency` / `IScopedDependency` — marker interface
-4. Custom registrar's `GetDefaultLifeTimeOrNull` — returns `null` to skip
+`DefaultConventionalRegistrar.AddType` (`Volo/Abp/DependencyInjection/DefaultConventionalRegistrar.cs`) applies these rules in order:
 
-For Singleton and Scoped registrations with multiple exposed service types, ABP creates **redirect descriptors** so that resolving any of the exposed interfaces returns the same underlying instance (no duplicated object graph).
+1. `[DisableConventionalRegistration]` on the type → skip entirely
+2. `[Dependency(Lifetime = …)]` attribute → use that `ServiceLifetime`
+3. `ITransientDependency` / `ISingletonDependency` / `IScopedDependency` marker interface → corresponding lifetime
+4. `GetDefaultLifeTimeOrNull` returns `null` → skip (no registration)
+
+After lifetime is determined, `GetExposedServiceTypes` and `GetExposedKeyedServiceTypes` resolve the set of interfaces/types to register for. For `Singleton` and `Scoped` registrations with multiple exposed types, `CreateServiceDescriptor` creates **redirect descriptors** (factory lambdas forwarding to the implementation type's registration) so all exposed interfaces resolve to the same underlying instance.
+
+`[Dependency]` also supports `ReplaceServices = true` (calls `services.Replace`) and `TryRegister = true` (calls `services.TryAdd`) for fine-grained registration control.
+
+## `AbpModule` Helper Methods
+
+`AbpModule` exposes several protected helpers that make `ConfigureServices` implementations concise:
+
+| Method | Delegates to |
+|---|---|
+| `Configure<TOptions>(Action<TOptions>)` | `ServiceConfigurationContext.Services.Configure(...)` |
+| `Configure<TOptions>(IConfiguration)` | `ServiceConfigurationContext.Services.Configure<TOptions>(configuration)` |
+| `PreConfigure<TOptions>(Action<TOptions>)` | `ServiceConfigurationContext.Services.PreConfigure(...)` |
+| `PostConfigure<TOptions>(Action<TOptions>)` | `ServiceConfigurationContext.Services.PostConfigure(...)` |
+| `PostConfigureAll<TOptions>(Action<TOptions>)` | `ServiceConfigurationContext.Services.PostConfigureAll(...)` |
+
+All of these throw `AbpException` if called outside the `ConfigureServices` phase because they access `ServiceConfigurationContext`.
+
+## Telemetry
+
+Both concrete application classes call `SetupTelemetryTrackingAsync()` (or the sync variant) immediately after `InitializeModulesAsync`. This is gated by `ShouldSendTelemetryData()`, which returns `true` only when:
+
+- The OS is Windows, macOS, or Linux
+- `IAbpHostEnvironment.IsDevelopment()` is `true`
+- `IConfiguration["Abp:Telemetry:IsEnabled"]` is not explicitly `false`
+
+The actual tracking is performed by `ITelemetryService.AddActivityAsync` resolved from a fresh DI scope. Any exception during telemetry is swallowed and logged at `Trace` level via `IInitLoggerFactory`.
 
 ## Subsystem Cross-Links
 

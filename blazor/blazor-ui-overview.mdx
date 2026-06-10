@@ -134,13 +134,17 @@ public class AbpAspNetCoreComponentsWebAssemblyModule : AbpModule
     public override async Task OnApplicationInitializationAsync(
         ApplicationInitializationContext context)
     {
-        // 1. Fetch application configuration
+        // 1. Fetch application configuration (uses IClientScopeServiceProviderAccessor)
         await context.ServiceProvider
+            .GetRequiredService<IClientScopeServiceProviderAccessor>()
+            .ServiceProvider
             .GetRequiredService<WebAssemblyCachedApplicationConfigurationClient>()
             .InitializeAsync();
 
         // 2. Initialize claims cache from configuration
         await context.ServiceProvider
+            .GetRequiredService<IClientScopeServiceProviderAccessor>()
+            .ServiceProvider
             .GetRequiredService<AbpComponentsClaimsCache>()
             .InitializeAsync();
 
@@ -153,9 +157,15 @@ public class AbpAspNetCoreComponentsWebAssemblyModule : AbpModule
 ### AbpBlazorClientHttpMessageHandler
 
 This `DelegatingHandler` sits in the `HttpClient` pipeline for all proxy-generated HTTP clients. It adds:
-- **Authorization header** — reads the access token from the OIDC authentication state
-- **Tenant header** — adds `__tenant` header from `ICurrentTenant`
-- **Culture header** — adds `Accept-Language` from `CultureInfo.CurrentUICulture`
+- **Accept-Language header** — reads the selected language from `localStorage.getItem("Abp.SelectedLanguage")` via JS interop
+- **AntiForgery header** — reads the `XSRF-TOKEN` cookie and sends it as `RequestVerificationToken` on non-safe HTTP methods (not GET/HEAD/OPTIONS/TRACE), but only for same-origin requests
+- **Timezone header** — adds `Abp-Timezone` from `ICurrentTimezoneProvider.TimeZone`
+- **UI progress** — calls `IUiPageProgressService.Go()` to show/hide the page progress bar around each HTTP request
+- **Streaming** — sets `SetBrowserRequestStreamingEnabled(true)` for HTTPS requests
+
+<Note>
+The handler does **not** add an `Authorization` header. Bearer token injection is handled separately by the OIDC client library and its own HTTP handler registered by `@abp/ng.oauth` on the Angular side, or by a dedicated `AbpBearerTokenHttpClientHandler` for .NET clients.
+</Note>
 
 ### WebAssemblyCachedApplicationConfigurationClient
 

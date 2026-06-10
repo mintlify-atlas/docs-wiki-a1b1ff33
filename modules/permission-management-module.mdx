@@ -221,13 +221,24 @@ Cache keys are structured as `pn:{providerName},{providerKey},{permissionName},{
 
 ## Application Service & HTTP API
 
-`IPermissionAppService` exposes a single resource-oriented operation:
+`IPermissionAppService` exposes operations for managing standard and resource-level permissions:
 
 ```csharp
 public interface IPermissionAppService : IApplicationService
 {
+    // Standard permission grant management
     Task<GetPermissionListResultDto> GetAsync(string providerName, string providerKey);
+    Task<GetPermissionListResultDto> GetByGroupAsync(string groupName, string providerName, string providerKey);
     Task UpdateAsync(string providerName, string providerKey, UpdatePermissionsDto input);
+
+    // Resource-level permission management
+    Task<GetResourceProviderListResultDto> GetResourceProviderKeyLookupServicesAsync(string resourceName);
+    Task<SearchProviderKeyListResultDto> SearchResourceProviderKeyAsync(string resourceName, string serviceName, string filter, int page);
+    Task<GetResourcePermissionDefinitionListResultDto> GetResourceDefinitionsAsync(string resourceName);
+    Task<GetResourcePermissionListResultDto> GetResourceAsync(string resourceName, string resourceKey);
+    Task<GetResourcePermissionWithProviderListResultDto> GetResourceByProviderAsync(string resourceName, string resourceKey, string providerName, string providerKey);
+    Task UpdateResourceAsync(string resourceName, string resourceKey, UpdateResourcePermissionsDto input);
+    Task DeleteResourceAsync(string resourceName, string resourceKey, string providerName, string providerKey);
 }
 ```
 

@@ -75,17 +75,11 @@ public virtual async Task<IdentityUserDto> RegisterAsync(RegisterDto input)
 ### IProfileAppService
 
 ```csharp
-[Authorize]
 public interface IProfileAppService : IApplicationService
 {
     Task<ProfileDto> GetAsync();
     Task<ProfileDto> UpdateAsync(UpdateProfileDto input);
     Task ChangePasswordAsync(ChangePasswordInput input);
-    Task<bool> HasPasswordAsync();
-    Task<bool> GetTwoFactorEnabledAsync();
-    Task SetTwoFactorEnabledAsync(SetTwoFactorEnabledInput input);
-    Task SendPhoneNumberChangeTokenAsync(SendPhoneNumberChangeTokenInput input);
-    Task ChangePhoneNumberAsync(ChangePhoneNumberInput input);
 }
 ```
 
@@ -117,10 +111,6 @@ All routes are under the `account` remote service area:
 | `GET` | `/api/account/my-profile` | Read own profile |
 | `PUT` | `/api/account/my-profile` | Update own profile |
 | `POST` | `/api/account/my-profile/change-password` | Change password |
-| `GET` | `/api/account/my-profile/two-factor-enabled` | Check 2FA status |
-| `PUT` | `/api/account/my-profile/two-factor-enabled` | Toggle 2FA |
-| `POST` | `/api/account/my-profile/send-phone-number-change-token` | Initiate phone change |
-| `POST` | `/api/account/my-profile/change-phone-number` | Confirm phone change |
 | `POST` | `/api/account/dynamic-claims/refresh` | Invalidate dynamic claims cache |
 
 ## Razor Pages (Account.Web)

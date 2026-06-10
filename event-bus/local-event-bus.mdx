@@ -1,7 +1,7 @@
 ---
 title: "Local Event Bus Internals — ABP Framework"
 sidebarTitle: "Local Event Bus"
-description: "How ABP's LocalEventBus works: handler registration, ConcurrentDictionary storage, EventName attribute, ordering via LocalEventHandlerOrderAttribute, and transactional publishing."
+description: "How ABP's LocalEventBus works: handler registration, ConcurrentDictionary storage, EventName attribute, ordering via LocalEventHandlerOrderAttribute, dynamic event support, and transactional publishing."
 ---
 
 The Local Event Bus is an in-process, synchronous-dispatch event bus. It is the right tool for domain events that must be handled within the same transaction as the operation that raised them — for example, updating a read-model table or sending a notification after a domain aggregate commits. Because it is entirely in-memory, there is no serialization, no broker, and no retry infrastructure.
@@ -15,13 +15,29 @@ flowchart TD
     EventBusBase -->|onUnitOfWorkComplete=false| LocalEventBus
     UoW -->|CompleteAsync| UoWEventPublisher["UnitOfWorkEventPublisher"]
     UoWEventPublisher -->|PublishLocalEventsAsync| LocalEventBus
-    LocalEventBus -->|TriggerHandlersAsync| HandlerFactories
+    LocalEventBus -->|PublishAsync LocalEventMessage| TriggerHandlers
+    TriggerHandlers -->|GetHandlerFactories| HandlerFactories
     HandlerFactories -->|Resolve & invoke| Handlers["ILocalEventHandler&lt;TEvent&gt;"]
 ```
 
+## File Inventory
+
+| File | Role |
+|---|---|
+| `Volo.Abp.EventBus.Abstractions` / `IEventBus.cs` | Root interface with all Subscribe/Unsubscribe/PublishAsync overloads |
+| `Volo.Abp.EventBus.Abstractions` / `Local/ILocalEventBus.cs` | Extends `IEventBus` with `Subscribe<TEvent>(ILocalEventHandler<TEvent>)`, `GetEventHandlerFactories`, `GetDynamicEventHandlerFactories` |
+| `Volo.Abp.EventBus.Abstractions` / `Local/ILocalEventHandler.cs` | `ILocalEventHandler<TEvent>` with `HandleEventAsync(TEvent)` |
+| `Volo.Abp.EventBus.Abstractions` / `Local/LocalEventHandlerOrderAttribute.cs` | Controls execution order via integer `Order` property |
+| `Volo.Abp.EventBus.Abstractions` / `EventNameAttribute.cs` | Overrides the string name used for publish/subscribe |
+| `Volo.Abp.EventBus` / `EventBusBase.cs` | Abstract base: UoW integration, `TriggerHandlersAsync`, `SubscribeHandlers` |
+| `Volo.Abp.EventBus` / `Local/LocalEventBus.cs` | Concrete singleton: three `ConcurrentDictionary` stores, handler sorting |
+| `Volo.Abp.EventBus` / `Local/LocalEventMessage.cs` | Envelope (`MessageId`, `EventData`, `EventType`) passed to `PublishAsync(LocalEventMessage)` |
+| `Volo.Abp.EventBus` / `UnitOfWorkEventPublisher.cs` | Drains the UoW queue at commit time for both local and distributed events |
+| `Volo.Abp.EventBus` / `AbpEventBusModule.cs` | DI auto-registration of `ILocalEventHandler<>` implementations into `AbpLocalEventBusOptions` |
+
 ## `LocalEventBus` Implementation
 
-`LocalEventBus` is a **singleton** (`ISingletonDependency`) registered under both `ILocalEventBus` and `LocalEventBus`. It extends the abstract `EventBusBase` class and stores handler factories in two `ConcurrentDictionary` maps:
+`LocalEventBus` is a **singleton** (`ISingletonDependency`) registered under both `ILocalEventBus` and `LocalEventBus`. It extends the abstract `EventBusBase` class and stores handler factories in three `ConcurrentDictionary` maps:
 
 ```csharp
 [ExposeServices(typeof(ILocalEventBus), typeof(LocalEventBus))]
@@ -50,6 +66,7 @@ public LocalEventBus(
     : base(serviceScopeFactory, currentTenant, unitOfWorkManager, eventHandlerInvoker)
 {
     Options = options.Value;
+    Logger = NullLogger<LocalEventBus>.Instance;
     HandlerFactories = new ConcurrentDictionary<Type, List<IEventHandlerFactory>>();
     EventTypes = new ConcurrentDictionary<string, Type>();
     DynamicEventHandlerFactories = new ConcurrentDictionary<string, List<IEventHandlerFactory>>();
@@ -57,14 +74,32 @@ public LocalEventBus(
 }
 ```
 
+`AbpEventBusModule.PreConfigureServices` uses `services.OnRegistered` to collect every type that implements `ILocalEventHandler<>` and adds it to `AbpLocalEventBusOptions.Handlers`, so explicit `options.Handlers.Add<T>()` calls are only needed when the handler is **not** a DI-registered type.
+
+## `ILocalEventBus` Interface
+
+```csharp
+public interface ILocalEventBus : IEventBus
+{
+    IDisposable Subscribe<TEvent>(ILocalEventHandler<TEvent> handler)
+        where TEvent : class;
+
+    List<EventTypeWithEventHandlerFactories> GetEventHandlerFactories(Type eventType);
+
+    List<EventTypeWithEventHandlerFactories> GetDynamicEventHandlerFactories(string eventName);
+}
+```
+
+The `GetEventHandlerFactories` and `GetDynamicEventHandlerFactories` methods expose the sorted factory lists for inspection (used in tests and diagnostics).
+
 ## Handler Registration
 
 ### Interface-based (recommended)
 
-Implement `ILocalEventHandler<TEvent>` and register the handler type in `AbpLocalEventBusOptions`:
+Implement `ILocalEventHandler<TEvent>` and register it as a transient DI service:
 
 ```csharp
-// Handler class
+// Handler class (auto-discovered by AbpEventBusModule)
 public class OrderCreatedEventHandler
     : ILocalEventHandler<OrderCreatedEto>, ITransientDependency
 {
@@ -73,15 +108,16 @@ public class OrderCreatedEventHandler
         // handle the event
     }
 }
+```
 
-// Module configuration
+Because `AbpEventBusModule` automatically discovers handlers, no extra configuration is needed. You can still add a handler explicitly:
+
+```csharp
 Configure<AbpLocalEventBusOptions>(options =>
 {
     options.Handlers.Add<OrderCreatedEventHandler>();
 });
 ```
-
-ABP's conventional registrar also discovers `ILocalEventHandler<TEvent>` implementations automatically if they are transient/scoped dependencies in the DI container.
 
 ### Lambda subscription
 
@@ -99,7 +135,7 @@ subscription.Dispose();
 
 Lambda subscriptions are stored as `SingleInstanceHandlerFactory` wrapping an `ActionEventHandler<TEvent>`.
 
-### `Subscribe` implementation
+### `Subscribe(Type, IEventHandlerFactory)` implementation
 
 ```csharp
 public override IDisposable Subscribe(Type eventType, IEventHandlerFactory factory)
@@ -121,9 +157,30 @@ public override IDisposable Subscribe(Type eventType, IEventHandlerFactory facto
 
 The `Locking` extension method acquires a `Monitor` lock on the list before mutation — providing thread-safety for the inner `List<IEventHandlerFactory>` (the outer `ConcurrentDictionary` only guarantees atomic key-level access).
 
+### Dynamic (string-name) subscriptions
+
+`Subscribe(string eventName, IEventHandlerFactory handler)` populates `DynamicEventHandlerFactories` and returns a `DynamicEventHandlerFactoryUnregistrar`:
+
+```csharp
+public override IDisposable Subscribe(string eventName, IEventHandlerFactory handler)
+{
+    GetOrCreateDynamicHandlerFactories(eventName).Locking(factories =>
+    {
+        if (!handler.IsInFactories(factories))
+        {
+            factories.Add(handler);
+        }
+    });
+
+    return new DynamicEventHandlerFactoryUnregistrar(this, eventName, handler);
+}
+```
+
+Dynamic subscriptions are useful for cross-cutting concerns (e.g., an audit logger that subscribes to all events by name) and for receiving events whose CLR type is not available at compile time.
+
 ## `[EventName]` Attribute
 
-`EventNameAttribute` provides an override for the string name used when publishing or subscribing by name. By default the name is the full CLR type name:
+`EventNameAttribute` provides an override for the string name used when publishing or subscribing by name. By default the name is the full CLR type name (`FullName`):
 
 ```csharp
 [EventName("Orders.Created")]
@@ -133,32 +190,51 @@ public class OrderCreatedEto
 }
 ```
 
-The `EventTypes` dictionary maps this string name to the CLR type, enabling dynamic subscribers (using `Subscribe(string eventName, ...)`) to receive strongly-typed dispatches.
+The `EventTypes` dictionary maps this string name to the CLR type, enabling dynamic subscribers to receive the same event as typed handlers. `EventNameAttribute.GetNameOrDefault(Type)` falls back to `eventType.FullName` when no attribute is present.
 
 ## Handler Invocation Order
 
-`LocalEventHandlerOrderAttribute` controls the order in which handlers are called for the same event type. Lower `Order` values execute first:
+`LocalEventHandlerOrderAttribute` controls the order in which handlers are called for the same event type. Lower `Order` values execute first (ascending sort):
 
 ```csharp
 [LocalEventHandlerOrder(-1)]   // runs before default (0) handlers
-public class PriorityHandler : ILocalEventHandler<OrderCreatedEto> { ... }
+public class PriorityHandler : ILocalEventHandler<OrderCreatedEto>, ITransientDependency { ... }
+
+[LocalEventHandlerOrder(10)]   // runs after default (0) handlers
+public class AuditHandler : ILocalEventHandler<OrderCreatedEto>, ITransientDependency { ... }
 ```
 
-`GetHandlerFactories` sorts handlers before returning them:
+`GetHandlerFactories` collects factories from both `HandlerFactories` and `DynamicEventHandlerFactories`, attaches the `Order` value from `LocalEventHandlerOrderAttribute` (defaulting to 0), then sorts by order before returning:
 
 ```csharp
 protected override IEnumerable<EventTypeWithEventHandlerFactories> GetHandlerFactories(Type eventType)
 {
     var handlerFactoryList = new List<Tuple<IEventHandlerFactory, Type, int>>();
+    var eventNames = EventTypes.Where(x => ShouldTriggerEventForHandler(eventType, x.Value))
+        .Select(x => x.Key).ToList();
 
-    foreach (var handlerFactory in HandlerFactories.Where(
-        hf => ShouldTriggerEventForHandler(eventType, hf.Key)))
+    // Strongly-typed handlers
+    foreach (var handlerFactory in HandlerFactories.Where(hf => ShouldTriggerEventForHandler(eventType, hf.Key)))
     {
         foreach (var factory in handlerFactory.Value)
         {
             handlerFactoryList.Add(new Tuple<IEventHandlerFactory, Type, int>(
                 factory,
                 handlerFactory.Key,
+                ReflectionHelper.GetAttributesOfMemberOrDeclaringType<LocalEventHandlerOrderAttribute>(
+                    factory.GetHandler().EventHandler.GetType())
+                    .FirstOrDefault()?.Order ?? 0));
+        }
+    }
+
+    // Dynamic (string-name) handlers that match any of the resolved event names
+    foreach (var handlerFactory in DynamicEventHandlerFactories.Where(aehf => eventNames.Contains(aehf.Key)))
+    {
+        foreach (var factory in handlerFactory.Value)
+        {
+            handlerFactoryList.Add(new Tuple<IEventHandlerFactory, Type, int>(
+                factory,
+                typeof(DynamicEventData),
                 ReflectionHelper.GetAttributesOfMemberOrDeclaringType<LocalEventHandlerOrderAttribute>(
                     factory.GetHandler().EventHandler.GetType())
                     .FirstOrDefault()?.Order ?? 0));
@@ -175,12 +251,46 @@ protected override IEnumerable<EventTypeWithEventHandlerFactories> GetHandlerFac
 
 Handlers with the same order value execute in registration order (first-registered, first-invoked).
 
+## Publish Flow
+
+`EventBusBase.PublishAsync` wraps every publish call:
+
+```csharp
+public virtual async Task PublishAsync(Type eventType, object eventData, bool onUnitOfWorkComplete = true)
+{
+    if (onUnitOfWorkComplete && UnitOfWorkManager.Current != null)
+    {
+        AddToUnitOfWork(
+            UnitOfWorkManager.Current,
+            new UnitOfWorkEventRecord(eventType, eventData, EventOrderGenerator.GetNext())
+        );
+        return;
+    }
+
+    await PublishToEventBusAsync(eventType, eventData);
+}
+```
+
+`LocalEventBus.PublishToEventBusAsync` wraps the data in a `LocalEventMessage` and calls `TriggerHandlersAsync`:
+
+```csharp
+protected override async Task PublishToEventBusAsync(Type eventType, object eventData)
+{
+    await PublishAsync(new LocalEventMessage(Guid.NewGuid(), eventData, eventType));
+}
+
+public virtual async Task PublishAsync(LocalEventMessage localEventMessage)
+{
+    await TriggerHandlersAsync(localEventMessage.EventType, localEventMessage.EventData);
+}
+```
+
 ## Transactional Publishing via `UnitOfWorkEventPublisher`
 
 When `PublishAsync` is called with `onUnitOfWorkComplete: true` (the default) and a UoW is active, the event is **held** in the UoW rather than immediately dispatched:
 
 ```csharp
-// In EventBusBase
+// In LocalEventBus
 protected override void AddToUnitOfWork(IUnitOfWork unitOfWork, UnitOfWorkEventRecord eventRecord)
 {
     unitOfWork.AddOrReplaceLocalEvent(eventRecord);
@@ -190,6 +300,7 @@ protected override void AddToUnitOfWork(IUnitOfWork unitOfWork, UnitOfWorkEventR
 At `UnitOfWork.CompleteAsync`, `UnitOfWorkEventPublisher.PublishLocalEventsAsync` drains the queue and dispatches each held event in `EventOrder` sequence:
 
 ```csharp
+[Dependency(ReplaceServices = true)]
 public class UnitOfWorkEventPublisher : IUnitOfWorkEventPublisher, ITransientDependency
 {
     public async Task PublishLocalEventsAsync(IEnumerable<UnitOfWorkEventRecord> localEvents)
@@ -203,14 +314,27 @@ public class UnitOfWorkEventPublisher : IUnitOfWorkEventPublisher, ITransientDep
             );
         }
     }
+
+    public async Task PublishDistributedEventsAsync(IEnumerable<UnitOfWorkEventRecord> distributedEvents)
+    {
+        foreach (var distributedEvent in distributedEvents)
+        {
+            await _distributedEventBus.PublishAsync(
+                distributedEvent.EventType,
+                distributedEvent.EventData,
+                onUnitOfWorkComplete: false,
+                useOutbox: distributedEvent.UseOutbox
+            );
+        }
+    }
 }
 ```
 
-This is the key guarantee: **a local event handler runs only after the database transaction commits**. If the UoW rolls back, the events are discarded.
+This is the key guarantee: **a local event handler runs only after the database transaction commits**. If the UoW rolls back, the events are discarded because the `UnitOfWorkEventRecord` objects are held only in memory.
 
 ### Event deduplication with replacement predicates
 
-`AddOrReplaceLocalEvent` accepts an optional `Predicate<UnitOfWorkEventRecord>` that identifies a prior record to replace:
+`AddOrReplaceLocalEvent` accepts an optional `Predicate<UnitOfWorkEventRecord>` that identifies a prior record to replace, preventing duplicate events when the same aggregate is modified multiple times inside a single UoW:
 
 ```csharp
 unitOfWork.AddOrReplaceLocalEvent(
@@ -219,8 +343,6 @@ unitOfWork.AddOrReplaceLocalEvent(
                       && ((StockChangedEto)existingRecord.EventData).ProductId == productId
 );
 ```
-
-This prevents duplicate events when the same aggregate is modified multiple times inside a single UoW.
 
 ## Subtype Matching
 
@@ -235,6 +357,27 @@ private static bool ShouldTriggerEventForHandler(Type targetEventType, Type hand
 }
 ```
 
+## Dynamic Event Publishing
+
+`PublishAsync(string eventName, object eventData, bool onUnitOfWorkComplete)` resolves the CLR type from `EventTypes`. If a type is found, it converts the data and re-publishes as strongly typed; otherwise it publishes a `DynamicEventData` envelope:
+
+```csharp
+public override Task PublishAsync(string eventName, object eventData, bool onUnitOfWorkComplete = true)
+{
+    var eventType = EventTypes.GetOrDefault(eventName);
+    var dynamicEventData = eventData as DynamicEventData ?? new DynamicEventData(eventName, eventData);
+
+    if (eventType != null)
+    {
+        return PublishAsync(eventType, ConvertDynamicEventData(dynamicEventData.Data, eventType), onUnitOfWorkComplete);
+    }
+
+    return PublishAsync(typeof(DynamicEventData), dynamicEventData, onUnitOfWorkComplete);
+}
+```
+
+`DynamicEventData` carries both an `EventName` string and an opaque `Data` object, allowing handlers that implement `ILocalEventHandler<DynamicEventData>` to receive untyped payloads.
+
 ## Thread Safety
 
 | Structure | Thread-safety mechanism |
@@ -245,7 +388,7 @@ private static bool ShouldTriggerEventForHandler(Type targetEventType, Type hand
 | Event dispatch (`TriggerHandlersAsync`) | Reads a snapshot of handler factories; concurrent publishes do not interfere |
 
 <Note>
-`LocalEventBus` is a singleton but dispatches handlers by resolving a new DI scope per handler invocation (done inside `EventBusBase.TriggerHandlersAsync`). Transient and scoped handlers are correctly disposed after each invocation.
+`LocalEventBus` is a singleton but dispatches handlers by resolving a new DI scope per handler invocation (done inside `EventBusBase.TriggerHandlerAsync`). Transient and scoped handlers are correctly disposed after each invocation.
 </Note>
 
 <Tip>

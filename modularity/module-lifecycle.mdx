@@ -10,23 +10,24 @@ Every ABP module participates in a deterministic lifecycle that spans two distin
 
 ### Services Configuration Phase
 
-These three interfaces are invoked by `AbpApplicationBase.ConfigureServicesAsync` while `IServiceCollection` is still mutable. The DI container does **not** exist yet.
+These three interfaces are invoked by `AbpApplicationBase.ConfigureServicesAsync`
+(`Volo.Abp.Core/Volo/Abp/AbpApplicationBase.cs`) while `IServiceCollection` is still mutable. The DI container does **not** exist yet.
 
-| Interface | When | Typical use |
-|---|---|---|
-| `IPreConfigureServices` | Before any `ConfigureServices` call | Reserve options slots, pre-register required services |
-| `IAbpModule` (via `ConfigureServices`) | Main configuration | Register module's own services, configure `IOptions<T>` |
-| `IPostConfigureServices` | After all `ConfigureServices` calls | Override or finalize registrations set by other modules |
+| Interface | File | When | Typical use |
+|---|---|---|---|
+| `IPreConfigureServices` | `IPreConfigureServices.cs` | Before any `ConfigureServices` call | Reserve options slots, pre-register required services |
+| `IAbpModule` (via `ConfigureServices`) | `IAbpModule.cs` | Main configuration; auto-scan runs just before each module's call | Register module's own services, configure `IOptions<T>` |
+| `IPostConfigureServices` | `IPostConfigureServices.cs` | After all `ConfigureServices` calls | Override or finalize registrations set by other modules |
 
 ```csharp
-// IPreConfigureServices.cs
+// Volo.Abp.Core/Volo/Abp/Modularity/IPreConfigureServices.cs
 public interface IPreConfigureServices
 {
     Task PreConfigureServicesAsync(ServiceConfigurationContext context);
     void PreConfigureServices(ServiceConfigurationContext context);
 }
 
-// IPostConfigureServices.cs
+// Volo.Abp.Core/Volo/Abp/Modularity/IPostConfigureServices.cs
 public interface IPostConfigureServices
 {
     Task PostConfigureServicesAsync(ServiceConfigurationContext context);
@@ -34,9 +35,10 @@ public interface IPostConfigureServices
 }
 ```
 
-`AbpModule` provides virtual no-op implementations for all three, and its async overloads delegate to the synchronous ones so a module only needs to override one:
+`AbpModule` provides virtual no-op implementations for all three. Its async overloads delegate to the synchronous ones so a module only needs to override one form:
 
 ```csharp
+// AbpModule.cs
 public virtual Task PreConfigureServicesAsync(ServiceConfigurationContext context)
 {
     PreConfigureServices(context);
@@ -47,35 +49,32 @@ public virtual void PreConfigureServices(ServiceConfigurationContext context) { 
 ```
 
 <Warning>
-`ServiceConfigurationContext` (and `ServiceConfigurationContext.Services`) is only valid during these three phases. ABP sets it to `null` after `PostConfigureServices` completes. Storing a reference to use later will cause a null-reference exception.
+`ServiceConfigurationContext` (and `ServiceConfigurationContext.Services`) is only valid during these three phases. `AbpApplicationBase` sets it to `null!` on each module instance after `PostConfigureServices` completes. Storing a reference to use later will cause a null-reference exception.
 </Warning>
+
+### Auto-Scan Timing Within ConfigureServices
+
+`AbpApplicationBase.ConfigureServicesAsync` runs the conventional registrar for each module's assemblies **in the same loop** as `ConfigureServicesAsync`. For each module (in dependency order), it first calls `Services.AddAssembly(assembly)` for each of the module's assemblies (unless `SkipAutoServiceRegistration` is set), then immediately calls `module.Instance.ConfigureServicesAsync(context)`. This means a module's own services are already registered in `IServiceCollection` by the time its `ConfigureServices` override runs.
 
 ### Application Initialization Phase
 
 These three interfaces are driven by `ModuleManager` after the DI container is built. An `ApplicationInitializationContext` carrying the scoped `IServiceProvider` is passed through.
 
-| Interface | Namespace | When | Typical use |
+| Interface | File | When | Typical use |
 |---|---|---|---|
-| `IOnPreApplicationInitialization` | `Volo.Abp.Modularity` | Earliest init point | Seed data, warm caches |
-| `IOnApplicationInitialization` | `Volo.Abp` | Main init | Configure ASP.NET Core pipeline (`app.UseXxx`) |
-| `IOnPostApplicationInitialization` | `Volo.Abp.Modularity` | After all main init | Post-start validation, background jobs |
+| `IOnPreApplicationInitialization` | `IOnPreApplicationInitialization.cs` | Earliest init point | Seed data, warm caches |
+| `IOnApplicationInitialization` | `IAbpModule.cs` (via `AbpModule`) | Main init | Configure ASP.NET Core pipeline (`app.UseXxx`) |
+| `IOnPostApplicationInitialization` | `IOnPostApplicationInitialization.cs` | After all main init | Post-start validation, background jobs |
 
 ```csharp
-// IOnPreApplicationInitialization.cs
+// Volo.Abp.Core/Volo/Abp/Modularity/IOnPreApplicationInitialization.cs
 public interface IOnPreApplicationInitialization
 {
     Task OnPreApplicationInitializationAsync(ApplicationInitializationContext context);
     void OnPreApplicationInitialization(ApplicationInitializationContext context);
 }
 
-// IOnApplicationInitialization.cs
-public interface IOnApplicationInitialization
-{
-    Task OnApplicationInitializationAsync(ApplicationInitializationContext context);
-    void OnApplicationInitialization(ApplicationInitializationContext context);
-}
-
-// IOnPostApplicationInitialization.cs
+// Volo.Abp.Core/Volo/Abp/Modularity/IOnPostApplicationInitialization.cs
 public interface IOnPostApplicationInitialization
 {
     Task OnPostApplicationInitializationAsync(ApplicationInitializationContext context);
@@ -83,10 +82,21 @@ public interface IOnPostApplicationInitialization
 }
 ```
 
+`IOnApplicationInitialization` is implemented directly by `AbpModule`:
+
+```csharp
+public virtual void OnApplicationInitialization(ApplicationInitializationContext context) { }
+public virtual Task OnApplicationInitializationAsync(ApplicationInitializationContext context)
+{
+    OnApplicationInitialization(context);
+    return Task.CompletedTask;
+}
+```
+
 ### Shutdown
 
 ```csharp
-// IOnApplicationShutdown.cs
+// Volo.Abp.Core/Volo/Abp/Modularity/IOnApplicationShutdown.cs (via AbpModule)
 public interface IOnApplicationShutdown
 {
     Task OnApplicationShutdownAsync(ApplicationShutdownContext context);
@@ -98,34 +108,36 @@ Shutdown is driven in **reverse dependency order** — the startup module shuts 
 
 ## Full Lifecycle Sequence
 
+The sequence below shows the true ordering from `AbpApplicationBase`. All `PreConfigureServices` calls complete across all modules before any `ConfigureServices` call starts. Within the `ConfigureServices` pass, assembly scanning runs for each module immediately before that module's `ConfigureServicesAsync` is invoked.
+
 ```mermaid
 sequenceDiagram
     participant App as AbpApplicationBase
-    participant SC as IServiceCollection
-    participant SP as IServiceProvider
+    participant M as Module (dependency order)
     participant MM as ModuleManager
-    participant M as Module (in dep order)
 
-    App->>M: PreConfigureServices [all modules]
-    App->>SC: AddAssembly (conventional DI scan)
-    App->>M: ConfigureServices [all modules]
-    App->>M: PostConfigureServices [all modules]
-    Note over SC,SP: IServiceProvider is built
+    App->>M: PreConfigureServices [all modules, in dep order]
+    loop For each module in dependency order
+        App->>M: AddAssembly (conventional DI scan)
+        App->>M: ConfigureServicesAsync
+    end
+    App->>M: PostConfigureServices [all modules, in dep order]
+    Note over App,M: IServiceProvider is built
     App->>MM: InitializeModulesAsync(context)
     MM->>M: OnPreApplicationInitialization [all modules]
     MM->>M: OnApplicationInitialization [all modules]
     MM->>M: OnPostApplicationInitialization [all modules]
     Note over App,MM: Application is running
     App->>MM: ShutdownModulesAsync(context)
-    MM->>M: OnApplicationShutdown [reverse order]
+    MM->>M: OnApplicationShutdown [reverse dep order]
 ```
 
 ## `IModuleLifecycleContributor` — The Contributor Pattern
 
-Rather than hard-coding calls to lifecycle interfaces, ABP uses a **contributor** pattern. Each lifecycle phase is represented by a dedicated contributor class, and `ModuleManager` iterates the registered contributors over all modules:
+Rather than hard-coding calls to lifecycle interfaces, ABP uses a **contributor** pattern. Each application-initialization phase is represented by a dedicated contributor class, and `ModuleManager` iterates the registered contributors over all modules:
 
 ```csharp
-// IModuleLifecycleContributor.cs
+// Volo.Abp.Core/Volo/Abp/Modularity/IModuleLifecycleContributor.cs
 public interface IModuleLifecycleContributor : ITransientDependency
 {
     Task InitializeAsync(ApplicationInitializationContext context, IAbpModule module);
@@ -140,7 +152,7 @@ Note that `IModuleLifecycleContributor` extends `ITransientDependency`, so every
 The abstract base class provides no-op defaults:
 
 ```csharp
-// ModuleLifecycleContributorBase.cs
+// Volo.Abp.Core/Volo/Abp/Modularity/ModuleLifecycleContributorBase.cs
 public abstract class ModuleLifecycleContributorBase : IModuleLifecycleContributor
 {
     public virtual Task InitializeAsync(ApplicationInitializationContext context, IAbpModule module)
@@ -154,7 +166,8 @@ public abstract class ModuleLifecycleContributorBase : IModuleLifecycleContribut
 
 ## Default Lifecycle Contributors
 
-Four contributors are registered by `AddCoreAbpServices` in `InternalServiceCollectionExtensions`:
+Four contributors are registered by `AddCoreAbpServices` in
+`Volo.Abp.Core/Volo/Abp/Internal/InternalServiceCollectionExtensions.cs`:
 
 ```csharp
 services.Configure<AbpModuleLifecycleOptions>(options =>
@@ -166,11 +179,9 @@ services.Configure<AbpModuleLifecycleOptions>(options =>
 });
 ```
 
-Each contributor pattern-matches the `IAbpModule` instance against the corresponding interface:
+All four are defined in `Volo.Abp.Core/Volo/Abp/Modularity/DefaultModuleLifecycleContributor.cs`. Each contributor pattern-matches the `IAbpModule` instance against the corresponding interface:
 
 ```csharp
-// DefaultModuleLifecycleContributor.cs (excerpt)
-
 public class OnApplicationInitializationModuleLifecycleContributor : ModuleLifecycleContributorBase
 {
     public async override Task InitializeAsync(
@@ -210,10 +221,9 @@ The cast-and-check pattern means a module only participates in a phase if it act
 
 ## `ModuleManager` — Driving the Contributors
 
-`ModuleManager` resolves its contributor list from `AbpModuleLifecycleOptions` at construction time and caches them as an array:
+`ModuleManager` (`Volo.Abp.Core/Volo/Abp/Modularity/ModuleManager.cs`) resolves its contributor list from `AbpModuleLifecycleOptions` at construction time and caches them as an array:
 
 ```csharp
-// ModuleManager.cs
 public class ModuleManager : IModuleManager, ISingletonDependency
 {
     private readonly IModuleContainer _moduleContainer;
@@ -238,10 +248,12 @@ public class ModuleManager : IModuleManager, ISingletonDependency
 ```
 
 <Note>
-`ModuleManager` itself implements `ISingletonDependency`, so it is registered as a singleton by the conventional registrar when the `Volo.Abp.Core` assembly is scanned.
+`ModuleManager` implements `ISingletonDependency`, so it is registered as a singleton by the conventional registrar when the `Volo.Abp.Core` assembly is scanned.
 </Note>
 
 ### `InitializeModulesAsync`
+
+The outer loop iterates contributors; the inner loop iterates modules. This means **all modules complete one phase before the next phase begins** — there is no per-module "run all phases then move to next module" behavior.
 
 ```csharp
 public virtual async Task InitializeModulesAsync(ApplicationInitializationContext context)
@@ -259,7 +271,8 @@ public virtual async Task InitializeModulesAsync(ApplicationInitializationContex
                 throw new AbpInitializationException(
                     $"An error occurred during the initialize " +
                     $"{contributor.GetType().FullName} phase of the module " +
-                    $"{module.Type.AssemblyQualifiedName}: {ex.Message}.", ex);
+                    $"{module.Type.AssemblyQualifiedName}: {ex.Message}. " +
+                    $"See the inner exception for details.", ex);
             }
         }
     }
@@ -267,7 +280,7 @@ public virtual async Task InitializeModulesAsync(ApplicationInitializationContex
 }
 ```
 
-The outer loop is **contributors**, the inner loop is **modules**. This means all modules complete one phase before the next phase begins — there is no per-module "run all phases then move to next module" behavior.
+`InitializeModules` (sync overload) follows the same pattern using the synchronous contributor method.
 
 ### `ShutdownModulesAsync`
 
@@ -279,15 +292,42 @@ public virtual async Task ShutdownModulesAsync(ApplicationShutdownContext contex
     {
         foreach (var module in modules)
         {
-            await contributor.ShutdownAsync(context, module.Instance);
+            try
+            {
+                await contributor.ShutdownAsync(context, module.Instance);
+            }
+            catch (Exception ex)
+            {
+                throw new AbpShutdownException(
+                    $"An error occurred during the shutdown " +
+                    $"{contributor.GetType().FullName} phase of the module " +
+                    $"{module.Type.AssemblyQualifiedName}: {ex.Message}. " +
+                    $"See the inner exception for details.", ex);
+            }
         }
     }
 }
 ```
 
-The `Reverse()` ensures the startup module (last in the sorted list) shuts down first.
+The `Reverse()` ensures the startup module (last in the sorted list) shuts down first. Shutdown is invoked from `AbpApplicationBase.ShutdownAsync` inside a new DI scope.
 
 ## `AbpModuleLifecycleOptions`
+
+`AbpModuleLifecycleOptions` (`Volo.Abp.Core/Volo/Abp/Modularity/AbpModuleLifecycleOptions.cs`) holds the ordered list of contributor types:
+
+```csharp
+public class AbpModuleLifecycleOptions
+{
+    public ITypeList<IModuleLifecycleContributor> Contributors { get; }
+
+    public AbpModuleLifecycleOptions()
+    {
+        Contributors = new TypeList<IModuleLifecycleContributor>();
+    }
+}
+```
+
+`Contributors` is an `ITypeList<IModuleLifecycleContributor>`, which stores `Type` objects rather than instances. `ModuleManager` resolves each type from DI at construction using `serviceProvider.GetRequiredService`, so contributors can have constructor dependencies.
 
 Custom contributors can be added by configuring `AbpModuleLifecycleOptions` in any module's `ConfigureServices`:
 
@@ -301,11 +341,42 @@ public override void ConfigureServices(ServiceConfigurationContext context)
 }
 ```
 
-`AbpModuleLifecycleOptions.Contributors` is an `ITypeList<IModuleLifecycleContributor>`, which stores types rather than instances. `ModuleManager` resolves each type from DI at construction, so contributors can have their own constructor dependencies.
+The order in `Contributors` controls the order phases are executed. The four built-in contributors are added in the order: `OnPreApplicationInitialization`, `OnApplicationInitialization`, `OnPostApplicationInitialization`, `OnApplicationShutdown`.
 
 ## Error Handling
 
-Both `InitializeModulesAsync` and `ShutdownModulesAsync` wrap contributor calls in try/catch and rethrow as `AbpInitializationException` / `AbpShutdownException` respectively, preserving the original exception as inner and providing the failing module's assembly-qualified name in the message.
+Both `InitializeModulesAsync` and `ShutdownModulesAsync` wrap contributor calls in try/catch:
+
+- Initialization errors are rethrown as `AbpInitializationException`
+- Shutdown errors are rethrown as `AbpShutdownException`
+
+Both preserve the original exception as `InnerException` and include the fully-qualified names of the failing contributor and module in the message.
+
+## Writing a Custom Lifecycle Contributor
+
+Inherit `ModuleLifecycleContributorBase` and override only the methods you need:
+
+```csharp
+public class MyLifecycleContributor : ModuleLifecycleContributorBase
+{
+    public override async Task InitializeAsync(
+        ApplicationInitializationContext context, IAbpModule module)
+    {
+        if (module is IMyLifecycleHook hook)
+        {
+            await hook.OnMyPhaseAsync(context);
+        }
+    }
+}
+
+// Register in any module:
+Configure<AbpModuleLifecycleOptions>(options =>
+{
+    options.Contributors.Add<MyLifecycleContributor>();
+});
+```
+
+Because `IModuleLifecycleContributor` extends `ITransientDependency`, custom contributors are automatically registered by the conventional registrar — no manual `services.AddTransient` is required.
 
 ## See Also
 

@@ -1,7 +1,7 @@
 ---
 title: "Distributed Event Bus Internals — ABP Framework"
 sidebarTitle: "Distributed Event Bus"
-description: "IDistributedEventBus, DistributedEventBusBase, provider implementations (RabbitMQ, Kafka, Azure Service Bus, Dapr), ETOs, serialization, and failure handling internals."
+description: "IDistributedEventBus, DistributedEventBusBase, ISupportsEventBoxes, provider implementations (RabbitMQ, Kafka, Azure Service Bus, Dapr), ETOs, serialization, and observability hooks."
 ---
 
 The Distributed Event Bus delivers events across process boundaries — between microservices or between independently deployed instances of the same service. It sits on top of a pluggable broker (RabbitMQ, Kafka, Azure Service Bus, or Dapr) and integrates with ABP's Unit of Work and the transactional Outbox/Inbox pattern to guarantee at-least-once delivery without dual-write problems.
@@ -12,6 +12,7 @@ The Distributed Event Bus delivers events across process boundaries — between 
 classDiagram
     IEventBus <|-- IDistributedEventBus
     IDistributedEventBus <|.. DistributedEventBusBase
+    ISupportsEventBoxes <|.. DistributedEventBusBase
     DistributedEventBusBase <|-- RabbitMqDistributedEventBus
     DistributedEventBusBase <|-- KafkaDistributedEventBus
     DistributedEventBusBase <|-- AzureServiceBusDistributedEventBus
@@ -19,19 +20,42 @@ classDiagram
 
     class IDistributedEventBus {
         +Subscribe(IDistributedEventHandler) IDisposable
+        +Subscribe(eventName, IDistributedEventHandler~DynamicEventData~) IDisposable
         +PublishAsync(TEvent, onUnitOfWorkComplete, useOutbox) Task
         +PublishAsync(Type, object, bool, bool) Task
         +PublishAsync(string, object, bool, bool) Task
     }
-    class DistributedEventBusBase {
-        #AddToOutboxAsync(Type, object) Task~bool~
-        #AddToInboxAsync(messageId, eventName, ...) Task~bool~
+    class ISupportsEventBoxes {
         +PublishFromOutboxAsync(OutgoingEventInfo, OutboxConfig) Task
         +PublishManyFromOutboxAsync(IEnumerable, OutboxConfig) Task
         +ProcessFromInboxAsync(IncomingEventInfo, InboxConfig) Task
+    }
+    class DistributedEventBusBase {
+        #AddToOutboxAsync(Type, object) Task~bool~
+        #AddToInboxAsync(messageId, eventName, ...) Task~bool~
+        +TriggerDistributedEventSentAsync(DistributedEventSent) Task
+        +TriggerDistributedEventReceivedAsync(DistributedEventReceived) Task
         #Serialize(object) byte[]
     }
 ```
+
+## File Inventory
+
+| File | Role |
+|---|---|
+| `Volo.Abp.EventBus.Abstractions` / `Distributed/IDistributedEventBus.cs` | Interface extending `IEventBus` with `useOutbox` parameter |
+| `Volo.Abp.EventBus.Abstractions` / `Distributed/IDistributedEventHandler.cs` | `IDistributedEventHandler<TEvent>` with `HandleEventAsync(TEvent)` |
+| `Volo.Abp.EventBus.Abstractions` / `Distributed/ISupportsEventBoxes.cs` | Contract for Outbox/Inbox operations, implemented by all providers |
+| `Volo.Abp.EventBus.Abstractions` / `Distributed/OutboxConfig.cs` | Config: `ImplementationType`, `DatabaseName`, `Selector`, `IsSendingEnabled` |
+| `Volo.Abp.EventBus.Abstractions` / `Distributed/InboxConfig.cs` | Config: `ImplementationType`, `DatabaseName`, `EventSelector`, `HandlerSelector`, `IsProcessingEnabled` |
+| `Volo.Abp.EventBus.Abstractions` / `Distributed/OutgoingEventInfo.cs` | Outbox row: `Id`, `EventName`, `EventData` (bytes), `CreationTime`, correlation via `ExtraProperties` |
+| `Volo.Abp.EventBus.Abstractions` / `Distributed/IncomingEventInfo.cs` | Inbox row: `Id`, `MessageId`, `EventName`, `EventData`, `Status`, `RetryCount`, `NextRetryTime` |
+| `Volo.Abp.EventBus.Abstractions` / `Distributed/DistributedEventSent.cs` | Side-channel notification published on the local bus after a direct send |
+| `Volo.Abp.EventBus.Abstractions` / `Distributed/DistributedEventReceived.cs` | Side-channel notification published on the local bus when a message is received |
+| `Volo.Abp.EventBus` / `Distributed/DistributedEventBusBase.cs` | Abstract base: UoW integration, Outbox/Inbox routing, observability notifications |
+| `Volo.Abp.EventBus` / `Distributed/AbpDistributedEventBusOptions.cs` | `Handlers`, `Outboxes`, `Inboxes` collections |
+| `Volo.Abp.EventBus` / `Distributed/OutboxSenderManager.cs` | `IBackgroundWorker` that starts one `OutboxSender` per configured outbox |
+| `Volo.Abp.EventBus` / `Distributed/InboxProcessManager.cs` | `IBackgroundWorker` that starts one `InboxProcessor` per configured inbox |
 
 ## `IDistributedEventBus`
 
@@ -40,6 +64,8 @@ public interface IDistributedEventBus : IEventBus
 {
     IDisposable Subscribe<TEvent>(IDistributedEventHandler<TEvent> handler)
         where TEvent : class;
+
+    IDisposable Subscribe(string eventName, IDistributedEventHandler<DynamicEventData> handler);
 
     Task PublishAsync<TEvent>(
         TEvent eventData,
@@ -62,6 +88,8 @@ public interface IDistributedEventBus : IEventBus
 ```
 
 The extra `useOutbox` parameter (absent from `ILocalEventBus`) controls whether the Outbox pattern is used. Passing `useOutbox: false` publishes directly to the broker, bypassing the database-backed reliability layer.
+
+The `string eventName` overload publishes dynamic (type-less) events — it resolves the CLR type from the event name registry if possible, otherwise wraps the data in a `DynamicEventData` envelope.
 
 ## `DistributedEventBusBase` — Publish Flow
 
@@ -94,6 +122,14 @@ public virtual async Task PublishAsync(
 
     // 3. Publish directly to the broker
     await PublishToEventBusAsync(eventType, eventData);
+
+    // 4. Fire side-channel notification on the local bus
+    await TriggerDistributedEventSentAsync(new DistributedEventSent()
+    {
+        Source = DistributedEventSource.Direct,
+        EventName = GetEventName(eventType, eventData),
+        EventData = GetEventData(eventData)
+    });
 }
 ```
 
@@ -102,6 +138,8 @@ The three-level decision tree ensures:
 2. After the UoW commits, if an Outbox is configured the serialized event is written to the database atomically with any other UoW changes
 3. If no Outbox is configured, the event goes straight to the broker
 
+Note that `EventBusBase.PublishAsync(Type, object, bool)` (without `useOutbox`) simply calls `PublishAsync(Type, object, bool, useOutbox: true)` — the `useOutbox` parameter is added at the `IDistributedEventBus` level.
+
 ### `AddToOutboxAsync`
 
 ```csharp
@@ -109,6 +147,8 @@ protected virtual async Task<bool> AddToOutboxAsync(Type eventType, object event
 {
     var unitOfWork = UnitOfWorkManager.Current;
     if (unitOfWork == null) return false;
+
+    var addedToOutbox = false;
 
     foreach (var outboxConfig in AbpDistributedEventBusOptions.Outboxes.Values
         .OrderBy(x => x.Selector is null))
@@ -119,6 +159,8 @@ protected virtual async Task<bool> AddToOutboxAsync(Type eventType, object event
                 .GetRequiredService(outboxConfig.ImplementationType);
 
             (var eventName, eventData) = ResolveEventForPublishing(eventType, eventData);
+
+            await OnAddToOutboxAsync(eventName, eventType, eventData);
 
             var outgoingEventInfo = new OutgoingEventInfo(
                 GuidGenerator.Create(),
@@ -132,13 +174,17 @@ protected virtual async Task<bool> AddToOutboxAsync(Type eventType, object event
                 outgoingEventInfo.SetCorrelationId(correlationId);
 
             await eventOutbox.EnqueueAsync(outgoingEventInfo);
-            return true;
+            addedToOutbox = true;
         }
     }
 
-    return false;
+    return addedToOutbox;
 }
 ```
+
+The method iterates **all** matching outbox configurations (not just the first), so an event can be written to multiple outboxes simultaneously if more than one selector matches. It returns `false` only when there is no active UoW or no outbox configuration is matched.
+
+`OnAddToOutboxAsync(string, Type, object)` is a protected virtual hook for provider-specific pre-processing before the row is inserted.
 
 ## ETOs — Event Transfer Objects
 
@@ -157,15 +203,31 @@ public class OrderCreatedEto
     public DateTime CreatedAt { get; set; }
 }
 
-// Tenant-aware ETO
+// Tenant-aware ETO using IEventDataMayHaveTenantId
 public class OrderCreatedEto : IEventDataMayHaveTenantId
 {
     public Guid? TenantId { get; set; }
-    public bool HasTenantId() => TenantId.HasValue;
+
+    // Returns true and sets tenantId when TenantId has a value
+    public bool IsMultiTenant(out Guid? tenantId)
+    {
+        tenantId = TenantId;
+        return TenantId.HasValue;
+    }
 }
 ```
 
-`IEventDataMayHaveTenantId` is used by provider implementations to route the event to the correct broker topic or queue partition when multi-tenancy is involved.
+`IEventDataMayHaveTenantId.IsMultiTenant(out Guid? tenantId)` is used by `EventBusBase.GetEventDataTenantId` to switch the current tenant context before invoking handlers.
+
+ABP also provides `EtoBase` (in `Volo.Abp.Domain.Entities.Events.Distributed`) as a base class for ETOs that need an `ExtraProperties` dictionary:
+
+```csharp
+[Serializable]
+public abstract class EtoBase
+{
+    public Dictionary<string, string> Properties { get; set; }
+}
+```
 
 ### `[EventName]` attribute
 
@@ -174,26 +236,26 @@ public class OrderCreatedEto : IEventDataMayHaveTenantId
 public class OrderCreatedEtoV2 { ... }
 ```
 
-Without the attribute, the event name defaults to the full CLR type name. For cross-service contracts that span codebases, always set an explicit name to avoid breaking changes from namespace/class renames.
+Without the attribute, the event name defaults to `eventType.FullName`. For cross-service contracts that span codebases, always set an explicit name to avoid breaking changes from namespace or class renames.
 
 ## Serialization
 
-`DistributedEventBusBase.Serialize(object eventData)` is abstract. Each provider supplies its own implementation:
+`DistributedEventBusBase.Serialize(object eventData)` is `protected abstract byte[]`. Each provider supplies its own implementation:
 
 | Provider | Serialization |
 |---|---|
-| RabbitMQ | `IRabbitMqSerializer` (JSON via `System.Text.Json` or Newtonsoft) |
+| RabbitMQ | JSON bytes via `IRabbitMqSerializer` (wraps `System.Text.Json` or Newtonsoft) |
 | Kafka | JSON bytes |
 | Azure Service Bus | JSON bytes |
 | Dapr | JSON via Dapr SDK |
 
-The serialized `byte[]` is stored in `OutgoingEventInfo.EventData` (for the Outbox) or sent directly to the broker message body.
+The serialized `byte[]` is stored in `OutgoingEventInfo.EventData` (for the Outbox) or sent directly as the broker message body.
 
 ## Provider Implementations
 
 ### RabbitMQ (`Volo.Abp.EventBus.RabbitMQ`)
 
-`RabbitMqDistributedEventBus` declares an exchange and queue on first use:
+`RabbitMqDistributedEventBus` declares an exchange and queue on initialization:
 
 ```csharp
 public void Initialize()
@@ -202,15 +264,13 @@ public void Initialize()
         new ExchangeDeclareConfiguration(
             AbpRabbitMqEventBusOptions.ExchangeName,
             type: AbpRabbitMqEventBusOptions.GetExchangeTypeOrDefault(),
-            durable: true,
-            arguments: AbpRabbitMqEventBusOptions.ExchangeArguments),
+            durable: true),
         new QueueDeclareConfiguration(
             AbpRabbitMqEventBusOptions.ClientName,
             durable: true,
             exclusive: false,
             autoDelete: false,
-            prefetchCount: AbpRabbitMqEventBusOptions.PrefetchCount,
-            arguments: AbpRabbitMqEventBusOptions.QueueArguments),
+            prefetchCount: AbpRabbitMqEventBusOptions.PrefetchCount),
         AbpRabbitMqEventBusOptions.ConnectionName
     );
 
@@ -219,7 +279,7 @@ public void Initialize()
 }
 ```
 
-- One **exchange** per application
+- One **exchange** per application (configurable name and type)
 - One **queue** per `ClientName` (typically the service name)
 - Subscribed event types are bound as routing keys
 - `IRabbitMqMessageConsumerFactory` creates a resilient consumer with automatic reconnect
@@ -235,24 +295,45 @@ All three follow the same `DistributedEventBusBase` contract. The provider-speci
 ## Subscribing to Distributed Events
 
 ```csharp
-// 1. Implement IDistributedEventHandler<TEvent>
+// 1. Implement IDistributedEventHandler<TEvent> (auto-discovered by AbpEventBusModule)
 public class OrderCreatedHandler
     : IDistributedEventHandler<OrderCreatedEto>, ITransientDependency
 {
     public async Task HandleEventAsync(OrderCreatedEto eventData)
     {
-        // ...
+        // handle the event
     }
 }
 
-// 2. Register in module
+// 2. Optionally register explicitly in module (not needed if the class is a DI-registered type)
 Configure<AbpDistributedEventBusOptions>(options =>
 {
     options.Handlers.Add<OrderCreatedHandler>();
 });
 ```
 
-Handler types in `AbpDistributedEventBusOptions.Handlers` are subscribed by the provider's `SubscribeHandlers` call (in `Initialize` / constructor). The subscription causes the provider to bind the routing key or topic filter to the application's queue.
+Handler types in `AbpDistributedEventBusOptions.Handlers` are subscribed by the provider's `SubscribeHandlers` call (in `Initialize` or the constructor). The subscription causes the provider to bind the routing key or topic filter to the application's queue.
+
+### Dynamic subscriptions
+
+Subscribe to untyped payloads from external systems by name:
+
+```csharp
+distributedEventBus.Subscribe(
+    "ExternalSystem.OrderPlaced",
+    new MyDynamicHandler()
+);
+
+public class MyDynamicHandler
+    : IDistributedEventHandler<DynamicEventData>, ITransientDependency
+{
+    public async Task HandleEventAsync(DynamicEventData eventData)
+    {
+        var orderId = eventData.Data; // raw object
+        // ...
+    }
+}
+```
 
 ## `AbpDistributedEventBusOptions`
 
@@ -270,14 +351,45 @@ public class AbpDistributedEventBusOptions
 }
 ```
 
-`OutboxConfigDictionary` and `InboxConfigDictionary` are dictionaries of `OutboxConfig` / `InboxConfig` objects. Each entry specifies:
-- `ImplementationType` — the `IEventOutbox` / `IEventInbox` implementation to use
-- `Selector` — optional `Func<Type, bool>` to limit which event types use this outbox/inbox
-- `DatabaseName` — used as part of the distributed lock name
+`OutboxConfigDictionary` and `InboxConfigDictionary` extend `Dictionary<string, OutboxConfig/InboxConfig>` and expose a `Configure(Action<OutboxConfig/InboxConfig>)` convenience method (see Outbox/Inbox page for setup details).
+
+## `ISupportsEventBoxes`
+
+`DistributedEventBusBase` implements `ISupportsEventBoxes`, the contract used by `OutboxSender` and `InboxProcessor` background workers to interact with the distributed event bus:
+
+```csharp
+public interface ISupportsEventBoxes
+{
+    Task PublishFromOutboxAsync(OutgoingEventInfo outgoingEvent, OutboxConfig outboxConfig);
+    Task PublishManyFromOutboxAsync(IEnumerable<OutgoingEventInfo> outgoingEvents, OutboxConfig outboxConfig);
+    Task ProcessFromInboxAsync(IncomingEventInfo incomingEvent, InboxConfig inboxConfig);
+}
+```
+
+`AsSupportsEventBoxes()` is an extension method that casts `IDistributedEventBus` to `ISupportsEventBoxes` (throwing if the implementation does not support it).
 
 ## Distributed Event Sent/Received Notifications
 
 `DistributedEventBusBase` publishes `DistributedEventSent` and `DistributedEventReceived` objects via the **local** event bus as side-channel notifications. This allows services to hook observability concerns (logging, metrics, tracing) without modifying the event handling chain:
+
+```csharp
+// Source enum values: Direct, Inbox, Outbox
+public class DistributedEventSent
+{
+    public DistributedEventSource Source { get; set; }
+    public string EventName { get; set; }
+    public object EventData { get; set; }
+}
+
+public class DistributedEventReceived
+{
+    public DistributedEventSource Source { get; set; }
+    public string EventName { get; set; }
+    public object EventData { get; set; }
+}
+```
+
+Both `TriggerDistributedEventSentAsync` and `TriggerDistributedEventReceivedAsync` swallow any exceptions from the local bus publish (they are fire-and-forget observability hooks):
 
 ```csharp
 public virtual async Task TriggerDistributedEventSentAsync(DistributedEventSent distributedEvent)
@@ -290,6 +402,8 @@ public virtual async Task TriggerDistributedEventSentAsync(DistributedEventSent 
 }
 ```
 
+`TriggerDistributedEventReceivedAsync` is called by both `TriggerHandlersDirectAsync` (direct delivery) and `TriggerHandlersFromInboxAsync` (inbox delivery), with the `Source` field set accordingly (`Direct` vs `Inbox`).
+
 ## Failure Handling
 
 Direct (non-Inbox) failure handling is broker-specific:
@@ -301,7 +415,7 @@ Direct (non-Inbox) failure handling is broker-specific:
 | Azure Service Bus | Message lock expires; dead-letter after `MaxDeliveryCount` |
 | Dapr | Dapr retries based on resiliency policy |
 
-When the **Inbox** pattern is enabled, failures are handled uniformly by `InboxProcessor` via `AbpEventBusBoxesOptions.InboxProcessorFailurePolicy` (see the Outbox/Inbox page for details).
+When the **Inbox** pattern is enabled, failures are handled uniformly by `InboxProcessor` via `AbpEventBusBoxesOptions.InboxProcessorFailurePolicy` (see the [Outbox/Inbox](./outbox-inbox) page for details).
 
 <Tip>
 For services that consume events from external systems (outside ABP), use `Subscribe(string eventName, IDistributedEventHandler&lt;DynamicEventData&gt; handler)` to receive untyped JSON payloads. Access the raw data via `DynamicEventData.Data`.

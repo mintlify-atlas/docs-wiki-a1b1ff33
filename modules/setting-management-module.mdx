@@ -48,7 +48,9 @@ public class Setting : Entity<Guid>, IAggregateRoot<Guid>
     public virtual string Value { get; internal set; }         // string value
 
     [CanBeNull]
-    public virtual string ProviderName { get; protected set; } // "G" | "T" | "U" | null
+    public virtual string ProviderName { get; protected set; } // GlobalSettingValueProvider.ProviderName |
+                                                               // TenantSettingValueProvider.ProviderName |
+                                                               // UserSettingValueProvider.ProviderName | null
 
     [CanBeNull]
     public virtual string ProviderKey { get; protected set; }  // tenantId | userId | null
@@ -58,6 +60,8 @@ public class Setting : Entity<Guid>, IAggregateRoot<Guid>
 There is no shared `SettingValue` class in the database model — the `Setting` entity is the record. The `SettingValue` DTO type (from `Volo.Abp.Settings`) is used at the application-contract layer only.
 
 The combination `(Name, ProviderName, ProviderKey)` is unique per tenant partition (the table is *not* multi-tenant partitioned by a `TenantId` column — the `ProviderName`/`ProviderKey` combination encodes the scope).
+
+The `GlobalSettingManagementProvider.Name` delegates to `GlobalSettingValueProvider.ProviderName`; similarly for the Tenant and User providers. The actual string values of those provider-name constants are defined in `Volo.Abp.Settings` and are `"G"` (Global), `"T"` (Tenant), and `"U"` (User) respectively.
 
 ### SettingDefinitionRecord / SettingGroupDefinitionRecord
 
@@ -69,14 +73,22 @@ Mirror of the Pattern in Permission Management and Feature Management: static se
 public interface ISettingManager
 {
     Task<string> GetOrNullAsync(
-        string name, string providerName, string providerKey, bool fallback = true);
+        [NotNull] string name,
+        [NotNull] string providerName,
+        [CanBeNull] string providerKey,
+        bool fallback = true);
 
     Task<List<SettingValue>> GetAllAsync(
-        string providerName, string providerKey, bool fallback = true);
+        [NotNull] string providerName,
+        [CanBeNull] string providerKey,
+        bool fallback = true);
 
     Task SetAsync(
-        string name, string value, string providerName,
-        string providerKey, bool forceToSet = false);
+        [NotNull] string name,
+        [CanBeNull] string value,
+        [NotNull] string providerName,
+        [CanBeNull] string providerKey,
+        bool forceToSet = false);
 
     Task DeleteAsync(string providerName, string providerKey);
 }

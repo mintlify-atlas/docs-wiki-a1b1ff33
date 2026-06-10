@@ -11,6 +11,7 @@ ABP's cross-cutting concerns — unit of work boundaries, audit logging, authori
 ### IAbpInterceptor
 
 ```csharp
+// Volo.Abp.Core — Volo.Abp.DynamicProxy namespace
 public interface IAbpInterceptor
 {
     Task InterceptAsync(IAbpMethodInvocation invocation);
@@ -24,6 +25,7 @@ Every interceptor receives an `IAbpMethodInvocation` and is responsible for call
 `AbpInterceptor` is the abstract base class. It enforces `InterceptAsync` as the single override point:
 
 ```csharp
+// Volo.Abp.Core — Volo.Abp.DynamicProxy namespace
 public abstract class AbpInterceptor : IAbpInterceptor
 {
     public abstract Task InterceptAsync(IAbpMethodInvocation invocation);
@@ -59,7 +61,7 @@ Interceptors can:
 
 ## Castle Windsor Adapter
 
-ABP delegates proxy generation to Castle Windsor. The bridge between `IAbpInterceptor` and Castle's `IInterceptor` is a two-layer adapter.
+ABP delegates proxy generation to Castle Windsor. The bridge between `IAbpInterceptor` and Castle's `IInterceptor` is a two-layer adapter, all in the `Volo.Abp.Castle.DynamicProxy` namespace.
 
 ### CastleAsyncAbpInterceptorAdapter
 
@@ -98,7 +100,7 @@ public class CastleAsyncAbpInterceptorAdapter<TInterceptor> : AsyncInterceptorBa
 
 ### AbpAsyncDeterminationInterceptor
 
-`AbpAsyncDeterminationInterceptor<TInterceptor>` is the Castle `IInterceptor` that is actually registered against proxied types. It composes `AsyncDeterminationInterceptor` with `CastleAsyncAbpInterceptorAdapter`:
+`AbpAsyncDeterminationInterceptor<TInterceptor>` (in `Volo.Abp.Castle.DynamicProxy`) is the Castle `IInterceptor` that is actually registered against proxied types. It composes `AsyncDeterminationInterceptor` with `CastleAsyncAbpInterceptorAdapter`:
 
 ```csharp
 public class AbpAsyncDeterminationInterceptor<TInterceptor> : AsyncDeterminationInterceptor
@@ -116,7 +118,8 @@ public class AbpAsyncDeterminationInterceptor<TInterceptor> : AsyncDetermination
 `CastleAbpMethodInvocationAdapter` implements `IAbpMethodInvocation` by delegating to Castle's `IInvocation`. `ProceedAsync` calls the Castle `proceed` delegate, which advances the proxy chain:
 
 ```csharp
-public class CastleAbpMethodInvocationAdapter : CastleAbpMethodInvocationAdapterBase, IAbpMethodInvocation
+public class CastleAbpMethodInvocationAdapter
+    : CastleAbpMethodInvocationAdapterBase, IAbpMethodInvocation
 {
     protected IInvocationProceedInfo ProceedInfo { get; }
     protected Func<IInvocation, IInvocationProceedInfo, Task> Proceed { get; }
@@ -127,6 +130,8 @@ public class CastleAbpMethodInvocationAdapter : CastleAbpMethodInvocationAdapter
     }
 }
 ```
+
+For methods with return values, `CastleAbpMethodInvocationAdapterWithReturnValue<TResult>` is used instead — it captures the result and exposes it via `ReturnValue`.
 
 ---
 
@@ -153,8 +158,8 @@ public static class UnitOfWorkInterceptorRegistrar
     private static bool ShouldIntercept(Type type)
     {
         return !DynamicProxyIgnoreTypes.Contains(type)
-            && type.IsDefined(typeof(UnitOfWorkAttribute), true)
-            || UnitOfWorkHelper.HasUnitOfWorkMethods(type);
+            && (type.IsDefined(typeof(UnitOfWorkAttribute), true)
+                || UnitOfWorkHelper.HasUnitOfWorkMethods(type));
     }
 }
 ```
@@ -205,10 +210,12 @@ public class UnitOfWorkInterceptor : AbpInterceptor, ITransientDependency
 
         using (var scope = _serviceScopeFactory.CreateScope())
         {
-            var uowManager = scope.ServiceProvider.GetRequiredService<IUnitOfWorkManager>();
+            var uowManager = scope.ServiceProvider
+                .GetRequiredService<IUnitOfWorkManager>();
 
             // Try to join a reserved UoW started by AbpUnitOfWorkMiddleware
-            if (uowManager.TryBeginReserved(UnitOfWork.UnitOfWorkReservationName, options))
+            if (uowManager.TryBeginReserved(
+                UnitOfWork.UnitOfWorkReservationName, options))
             {
                 await invocation.ProceedAsync();
                 await uowManager.Current?.SaveChangesAsync();
@@ -271,5 +278,5 @@ Interceptors are invoked in the order they are added to `context.Interceptors`. 
 </Note>
 
 <Warning>
-Only classes registered with Castle Windsor proxy support (i.e., registered via ABP's DI infrastructure with `IConventionalRegistrar`) receive interceptors. Services registered with raw `services.AddTransient<T>()` bypassing ABP's conventional registration will not have proxies applied.
+Only classes registered through ABP's DI infrastructure (via `IConventionalRegistrar`) receive interceptors. Services registered with raw `services.AddTransient<T>()` bypassing ABP's conventional registration will not have proxies applied.
 </Warning>

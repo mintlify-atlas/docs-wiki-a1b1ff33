@@ -37,25 +37,28 @@ There is no Application/HttpApi layer in the OpenIddict module itself. Managemen
 
 ### OpenIddictApplication
 
-Represents an OAuth2 / OIDC client registration. Stored as a `FullAuditedAggregateRoot<Guid>`:
+Represents an OAuth2 / OIDC client registration. Stored as a `FullAuditedAggregateRoot<Guid>` in namespace `Volo.Abp.OpenIddict.Applications`:
 
 ```csharp
 public class OpenIddictApplication : FullAuditedAggregateRoot<Guid>
 {
+    public virtual string ApplicationType { get; set; }
     public virtual string ClientId { get; set; }
     public virtual string ClientSecret { get; set; }   // hashed by manager
     public virtual string ClientType { get; set; }     // "public" | "confidential"
-    public virtual string ApplicationType { get; set; }
     public virtual string ConsentType { get; set; }    // "explicit" | "implicit" | "external"
     public virtual string DisplayName { get; set; }
     public virtual string DisplayNames { get; set; }   // JSON: localized names
+    public virtual string JsonWebKeySet { get; set; }
     public virtual string Permissions { get; set; }    // JSON array of granted endpoints/grants
+    public virtual string PostLogoutRedirectUris { get; set; }  // JSON array
+    public virtual string Properties { get; set; }     // JSON: additional properties
     public virtual string RedirectUris { get; set; }   // JSON array
-    public virtual string PostLogoutRedirectUris { get; set; }
     public virtual string Requirements { get; set; }   // e.g. PKCE requirement
     public virtual string Settings { get; set; }
-    public virtual string JsonWebKeySet { get; set; }
     public virtual string FrontChannelLogoutUri { get; set; }
+    public virtual string ClientUri { get; set; }      // link to further info about client
+    public virtual string LogoUri { get; set; }        // URI to client logo
 }
 ```
 
@@ -63,7 +66,7 @@ All multi-value fields (URIs, permissions, display names) are JSON-serialized st
 
 ### OpenIddictScope
 
-Defines an OAuth2 scope that can be granted to clients:
+Defines an OAuth2 scope that can be granted to clients (namespace `Volo.Abp.OpenIddict.Scopes`):
 
 ```csharp
 public class OpenIddictScope : FullAuditedAggregateRoot<Guid>
@@ -78,7 +81,7 @@ public class OpenIddictScope : FullAuditedAggregateRoot<Guid>
 
 ### OpenIddictAuthorization
 
-Records a user's consent grant, linking a subject (user ID) to an application and a set of scopes:
+Records a user's consent grant, linking a subject (user ID) to an application and a set of scopes (namespace `Volo.Abp.OpenIddict.Authorizations`):
 
 ```csharp
 public class OpenIddictAuthorization : AggregateRoot<Guid>
@@ -89,12 +92,13 @@ public class OpenIddictAuthorization : AggregateRoot<Guid>
     public virtual string Status { get; set; }    // "valid" | "redeemed" | "revoked"
     public virtual string Type { get; set; }      // "permanent" | "ad-hoc"
     public virtual DateTime? CreationDate { get; set; }
+    public virtual string Properties { get; set; }
 }
 ```
 
 ### OpenIddictToken
 
-Stores issued tokens (access tokens, refresh tokens, authorization codes, device codes):
+Stores issued tokens (access tokens, refresh tokens, authorization codes, device codes) in namespace `Volo.Abp.OpenIddict.Tokens`:
 
 ```csharp
 public class OpenIddictToken : AggregateRoot<Guid>
@@ -105,6 +109,7 @@ public class OpenIddictToken : AggregateRoot<Guid>
     public virtual string Status { get; set; }         // "valid" | "redeemed" | "revoked"
     public virtual string Subject { get; set; }
     public virtual string Payload { get; set; }        // reference token payload (encrypted)
+    public virtual string Properties { get; set; }     // JSON: additional properties
     public virtual string ReferenceId { get; set; }    // hashed reference ID
     public virtual DateTime? CreationDate { get; set; }
     public virtual DateTime? ExpirationDate { get; set; }
@@ -146,15 +151,34 @@ ABP derives custom managers from OpenIddict's built-in ones:
 
 ## Token Cleanup
 
-Expired and revoked tokens accumulate over time. `TokenCleanupBackgroundWorker` runs on a configurable interval and calls `TokenCleanupService`:
+Expired and revoked tokens accumulate over time. `TokenCleanupBackgroundWorker` runs on a configurable interval and calls `TokenCleanupService`. The actual `TokenCleanupOptions` class (from `Volo.Abp.OpenIddict.Tokens`) contains:
 
 ```csharp
-// TokenCleanupOptions defaults
 public class TokenCleanupOptions
 {
-    public int CleanupPeriod { get; set; } = 3_600_000; // 1 hour in ms
-    public int CleanupCount { get; set; } = 2_000;       // max tokens removed per run
+    /// <summary>Default: true.</summary>
     public bool IsCleanupEnabled { get; set; } = true;
+
+    /// <summary>Default: 3,600,000 ms (1 hour).</summary>
+    public int CleanupPeriod { get; set; } = 3_600_000;
+
+    /// <summary>Disable pruning of old authorization records.</summary>
+    public bool DisableAuthorizationPruning { get; set; }
+
+    /// <summary>Disable pruning of old token records.</summary>
+    public bool DisableTokenPruning { get; set; }
+
+    /// <summary>
+    /// Minimum lifespan authorizations must have to be pruned.
+    /// Default: 14 days; cannot be less than 10 minutes.
+    /// </summary>
+    public TimeSpan MinimumAuthorizationLifespan { get; set; } = TimeSpan.FromDays(14);
+
+    /// <summary>
+    /// Minimum lifespan tokens must have to be pruned.
+    /// Default: 14 days; cannot be less than 10 minutes.
+    /// </summary>
+    public TimeSpan MinimumTokenLifespan { get; set; } = TimeSpan.FromDays(14);
 }
 ```
 
@@ -196,7 +220,7 @@ Prior to ABP v6.x, `Volo.Abp.IdentityServer` was the default OAuth2 server. The 
     OpenIddict uses different table names (`OpenIddictApplications`, `OpenIddictTokens`, etc.) vs IdentityServer's `Clients`, `ApiResources` tables. A migration script or a fresh EF migration is required.
   </Step>
   <Step title="Re-seed clients">
-    Update data seed contributors to use `AbpApplicationDescriptor` / `AbpOpenIddictDataSeedContributorBase` instead of IdentityServer's `IdentityServerDataSeedContributor`.
+    Update data seed contributors to use `AbpApplicationDescriptor` / `OpenIddictDataSeedContributorBase` instead of IdentityServer's `IdentityServerDataSeedContributor`.
   </Step>
   <Step title="Update Account.Web">
     Switch from `Volo.Abp.Account.Web.IdentityServer` to `Volo.Abp.Account.Web.OpenIddict`.

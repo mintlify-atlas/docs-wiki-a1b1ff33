@@ -156,7 +156,9 @@ Each `ActionApiDescriptionModel` contains `HttpMethod`, `Url` (template with `{i
 protected virtual void AddHeaders(HttpRequestMessage requestMessage)
 {
     // Distributed tracing
-    requestMessage.Headers.Add(AbpCorrelationIdOptions.HttpHeaderName, correlationId);
+    var correlationId = CorrelationIdProvider.Get();
+    if (correlationId != null)
+        requestMessage.Headers.Add(AbpCorrelationIdOptions.HttpHeaderName, correlationId);
 
     // Multi-tenancy
     if (CurrentTenant.Id.HasValue)
@@ -165,7 +167,11 @@ protected virtual void AddHeaders(HttpRequestMessage requestMessage)
 
     // Localization
     var currentCulture = CultureInfo.CurrentUICulture.Name ?? CultureInfo.CurrentCulture.Name;
-    requestMessage.Headers.AcceptLanguage.Add(new StringWithQualityHeaderValue(currentCulture));
+    if (!currentCulture.IsNullOrEmpty())
+        requestMessage.Headers.AcceptLanguage.Add(new StringWithQualityHeaderValue(currentCulture));
+
+    // Mark as AJAX request
+    requestMessage.Headers.Add("X-Requested-With", "XMLHttpRequest");
 }
 ```
 

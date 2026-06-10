@@ -68,13 +68,13 @@ public class Post : FullAuditedAggregateRoot<Guid>
     public virtual Guid BlogId { get; protected set; }
 
     [NotNull]
-    public virtual string Title { get; protected set; }
-
-    [NotNull]
     public virtual string Url { get; protected set; }    // URL segment for the post
 
     [NotNull]
-    public virtual string CoverImage { get; set; }
+    public virtual string CoverImage { get; set; }       // cover image URL or path
+
+    [NotNull]
+    public virtual string Title { get; protected set; }
 
     [CanBeNull]
     public virtual string Content { get; set; }          // Markdown content
@@ -87,6 +87,8 @@ public class Post : FullAuditedAggregateRoot<Guid>
     public virtual Collection<PostTag> Tags { get; protected set; }
 }
 ```
+
+The constructor signature is `Post(Guid id, Guid blogId, string title, string coverImage, string url)`. All three fields `Title`, `CoverImage`, and `Url` are non-nullable and validated with `Check.NotNullOrWhiteSpace`.
 
 Domain behaviors:
 
@@ -108,17 +110,15 @@ post.IncreaseReadCount();
 Threaded comments with reply support:
 
 ```csharp
-// From domain source structure
 public class Comment : FullAuditedAggregateRoot<Guid>
 {
-    public virtual Guid BlogPostId { get; protected set; }
-    public virtual string Text { get; protected set; }
+    public virtual Guid PostId { get; protected set; }          // references Post.Id
     public virtual Guid? RepliedCommentId { get; protected set; }
-    public virtual Guid CreatorId { get; set; }
+    public virtual string Text { get; protected set; }
 }
 ```
 
-Unlike CmsKit's `Comment` (which is polymorphic across entity types via `EntityType`/`EntityId`), the Blogging `Comment` is hardcoded to `BlogPostId`.
+Unlike CmsKit's `Comment` (which is polymorphic across entity types via `EntityType`/`EntityId`), the Blogging `Comment` is hardcoded to `PostId` (not `BlogPostId`) referencing the `Post` aggregate.
 
 ### Tag and PostTag
 
@@ -153,19 +153,25 @@ Local replica of `IdentityUser` for cross-module data isolation, analogous to `C
 ```csharp
 public interface IBlogRepository : IBasicRepository<Blog, Guid>
 {
-    Task<Blog> FindByShortNameAsync(string shortName, CancellationToken ct = default);
+    Task<Blog> FindByShortNameAsync(string shortName, CancellationToken cancellationToken = default);
 }
 
 public interface IPostRepository : IBasicRepository<Post, Guid>
 {
-    Task<List<Post>> GetListAsync(
-        int skipCount, int maxResultCount, Guid blogId,
-        string filter = null, CancellationToken ct = default);
+    Task<List<Post>> GetPostsByBlogId(Guid id, CancellationToken cancellationToken = default);
 
-    Task<List<Post>> GetListByBlogIdAndTagNameAsync(
-        Guid blogId, string tagName, CancellationToken ct = default);
+    Task<bool> IsPostUrlInUseAsync(
+        Guid blogId, string url, Guid? excludingPostId = null,
+        CancellationToken cancellationToken = default);
 
-    Task<Post> GetPostByUrlAsync(Guid blogId, string url, CancellationToken ct = default);
+    Task<Post> GetPostByUrl(Guid blogId, string url, CancellationToken cancellationToken = default);
+
+    Task<List<Post>> GetOrderedList(
+        Guid blogId, bool descending = false, CancellationToken cancellationToken = default);
+
+    Task<List<Post>> GetListByUserIdAsync(Guid userId, CancellationToken cancellationToken = default);
+
+    Task<List<Post>> GetLatestBlogPostsAsync(Guid blogId, int count, CancellationToken cancellationToken = default);
 }
 ```
 
@@ -228,7 +234,7 @@ Both modules model blogs and posts but serve different purposes:
 |---|---|---|
 | **Maturity** | Older, standalone module | Newer building-block |
 | **UI** | Full Razor Pages blogging UI out of the box | Building blocks; UI must be assembled |
-| **Comment model** | `BlogPostId` (hardcoded) | Polymorphic via `EntityType`/`EntityId` |
+| **Comment model** | `PostId` (hardcoded to Post) | Polymorphic via `EntityType`/`EntityId` |
 | **Slug field** | `Url` (no normalization) | `Slug` (via `SlugNormalizer`) |
 | **Tag count** | Denormalized `UsageCount` on `Tag` | No denormalization |
 | **Post status** | No status workflow | `Draft → WaitingForReview → Published` |

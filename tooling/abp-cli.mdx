@@ -48,6 +48,7 @@ public class CliService : ITransientDependency
     protected IServiceScopeFactory ServiceScopeFactory { get; }
     protected PackageVersionCheckerService PackageVersionCheckerService { get; }
     protected CliVersionService CliVersionService { get; }
+    public ICmdHelper CmdHelper { get; }
     // ...
 }
 ```
@@ -84,9 +85,11 @@ Each command runs in its own DI scope so transient and scoped services are prope
 | Pre-release label | Channel | Feed |
 |---|---|---|
 | _(none)_ | `Stable` | NuGet.org `Volo.Abp.Cli` |
-| `rc.*` | `Prerelease` | NuGet.org `Volo.Abp.Cli` (pre-release) |
-| `preview.*` | `Nightly` | MyGet nightly feed |
-| `dev.*` | `Development` | _(skipped)_ |
+| `preview` | `Nightly` | MyGet nightly feed |
+| `dev` | `Development` | _(skipped)_ |
+| anything else pre-release | `Prerelease` | NuGet.org `Volo.Abp.Cli` (pre-release) |
+
+The logic in source is: if `currentCliVersion.Release.Contains("preview")` → `Nightly`; if contains `"dev"` → `Development`; otherwise any pre-release → `Prerelease`.
 
 ## `IConsoleCommand` — the command contract
 
@@ -165,17 +168,41 @@ Configure<AbpCliOptions>(options =>
 // framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/AbpCliCoreModule.cs
 Configure<AbpCliOptions>(options =>
 {
-    options.Commands[NewCommand.Name]             = typeof(NewCommand);
-    options.Commands[AddPackageCommand.Name]      = typeof(AddPackageCommand);
-    options.Commands[AddModuleCommand.Name]       = typeof(AddModuleCommand);
-    options.Commands[GenerateProxyCommand.Name]   = typeof(GenerateProxyCommand);
-    options.Commands[RemoveProxyCommand.Name]     = typeof(RemoveProxyCommand);
-    options.Commands[BundleCommand.Name]          = typeof(BundleCommand);
-    options.Commands[BuildCommand.Name]           = typeof(BuildCommand);
-    options.Commands[CleanCommand.Name]           = typeof(CleanCommand);
-    options.Commands[LoginCommand.Name]           = typeof(LoginCommand);
-    options.Commands[LogoutCommand.Name]          = typeof(LogoutCommand);
-    // ... and many more
+    options.Commands[HelpCommand.Name]                              = typeof(HelpCommand);
+    options.Commands[PromptCommand.Name]                            = typeof(PromptCommand);
+    options.Commands[NewCommand.Name]                               = typeof(NewCommand);
+    options.Commands[GetSourceCommand.Name]                         = typeof(GetSourceCommand);
+    options.Commands[UpdateCommand.Name]                            = typeof(UpdateCommand);
+    options.Commands[AddPackageCommand.Name]                        = typeof(AddPackageCommand);
+    options.Commands[AddModuleCommand.Name]                         = typeof(AddModuleCommand);
+    options.Commands[ListModulesCommand.Name]                       = typeof(ListModulesCommand);
+    options.Commands[ListTemplatesCommand.Name]                     = typeof(ListTemplatesCommand);
+    options.Commands[LoginCommand.Name]                             = typeof(LoginCommand);
+    options.Commands[LoginInfoCommand.Name]                         = typeof(LoginInfoCommand);
+    options.Commands[LogoutCommand.Name]                            = typeof(LogoutCommand);
+    options.Commands[GenerateProxyCommand.Name]                     = typeof(GenerateProxyCommand);
+    options.Commands[RemoveProxyCommand.Name]                       = typeof(RemoveProxyCommand);
+    options.Commands[SuiteCommand.Name]                             = typeof(SuiteCommand);
+    options.Commands[SwitchToPreviewCommand.Name]                   = typeof(SwitchToPreviewCommand);
+    options.Commands[SwitchToStableCommand.Name]                    = typeof(SwitchToStableCommand);
+    options.Commands[SwitchToNightlyCommand.Name]                   = typeof(SwitchToNightlyCommand);
+    options.Commands[SwitchToPreRcCommand.Name]                     = typeof(SwitchToPreRcCommand);
+    options.Commands[SwitchToLocal.Name]                            = typeof(SwitchToLocal);
+    options.Commands[TranslateCommand.Name]                         = typeof(TranslateCommand);
+    options.Commands[BuildCommand.Name]                             = typeof(BuildCommand);
+    options.Commands[BundleCommand.Name]                            = typeof(BundleCommand);
+    options.Commands[CreateMigrationAndRunMigratorCommand.Name]     = typeof(CreateMigrationAndRunMigratorCommand);
+    options.Commands[InstallLibsCommand.Name]                       = typeof(InstallLibsCommand);
+    options.Commands[CleanCommand.Name]                             = typeof(CleanCommand);
+    options.Commands[CliCommand.Name]                               = typeof(CliCommand);
+    options.Commands[ClearDownloadCacheCommand.Name]                = typeof(ClearDownloadCacheCommand);
+    options.Commands[RecreateInitialMigrationCommand.Name]          = typeof(RecreateInitialMigrationCommand);
+    options.Commands[GenerateRazorPage.Name]                        = typeof(GenerateRazorPage);
+    options.Commands[McpCommand.Name]                               = typeof(McpCommand);
+    options.Commands[GenerateJwksCommand.Name]                      = typeof(GenerateJwksCommand);
+
+    options.DisabledModulesToAddToSolution.Add("Volo.Abp.LeptonXTheme.Pro");
+    options.DisabledModulesToAddToSolution.Add("Volo.Abp.LeptonXTheme.Lite");
 });
 ```
 
@@ -184,9 +211,9 @@ It also registers the three built-in service-proxy generators:
 ```csharp
 Configure<AbpCliServiceProxyOptions>(options =>
 {
-    options.Generators["JS"]     = typeof(JavaScriptServiceProxyGenerator);
-    options.Generators["NG"]     = typeof(AngularServiceProxyGenerator);
-    options.Generators["CSHARP"] = typeof(CSharpServiceProxyGenerator);
+    options.Generators[JavaScriptServiceProxyGenerator.Name] = typeof(JavaScriptServiceProxyGenerator);
+    options.Generators[AngularServiceProxyGenerator.Name]    = typeof(AngularServiceProxyGenerator);
+    options.Generators[CSharpServiceProxyGenerator.Name]     = typeof(CSharpServiceProxyGenerator);
 });
 ```
 
@@ -207,9 +234,9 @@ The stored token is consumed by `TemplateProjectBuilder` when downloading Pro te
 Because `AbpCliOptions.Commands` is a plain dictionary configured through the standard ABP `Configure<TOptions>` pattern, any ABP module loaded into the host application can add, replace, or remove commands. ABP Suite (`SuiteCommand`) is an example of a command that ships in a separate NuGet package but plugs into the same dispatch mechanism.
 
 <Note>
-The `HideFromCommandList` attribute (in the `Internal` sub-namespace) suppresses a command from the `help` output while still registering it normally. `RecreateInitialMigrationCommand` uses this to hide internal tooling commands from end users.
+The `HideFromCommandList` attribute (in the `Commands/Internal` sub-namespace) suppresses a command from the `help` output while still registering it normally. `RecreateInitialMigrationCommand` and `CreateMigrationAndRunMigratorCommand` use this to hide internal tooling commands from end users.
 </Note>
 
 <Tip>
-To inspect what commands are registered at runtime, resolve `IOptions&lt;AbpCliOptions&gt;` and enumerate `.Value.Commands.Keys`. This is also how `HelpCommand` generates its list.
+To inspect what commands are registered at runtime, resolve `IOptions<AbpCliOptions>` and enumerate `.Value.Commands.Keys`. This is also how `HelpCommand` generates its list.
 </Tip>

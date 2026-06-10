@@ -28,7 +28,7 @@ The `TArgs` type is resolved to a named job via `AbpBackgroundJobOptions.GetBack
 
 ### Job Registration: AbpBackgroundJobOptions
 
-`AbpBackgroundJobOptions` holds a bidirectional dictionary mapping args-types ↔ job-names, plus a delegate for resolving job names:
+`AbpBackgroundJobOptions` holds two bidirectional dictionaries mapping args-types ↔ job-names and job-names ↔ job-names, plus a delegate for resolving job names:
 
 ```csharp
 public class AbpBackgroundJobOptions
@@ -40,6 +40,8 @@ public class AbpBackgroundJobOptions
     public void AddJob(BackgroundJobConfiguration jobConfiguration) { ... }
     public BackgroundJobConfiguration GetJob(Type argsType) { ... }
     public BackgroundJobConfiguration GetJob(string name) { ... }
+    public BackgroundJobConfiguration? GetJobOrNull(string name) { ... }
+    public IReadOnlyList<BackgroundJobConfiguration> GetJobs() { ... }
 }
 ```
 
@@ -47,7 +49,7 @@ Call `options.AddJob<MyJob>()` in your module's `ConfigureServices` to register 
 
 ### Default Storage: InMemoryBackgroundJobStore
 
-The default implementation keeps jobs in a `ConcurrentDictionary`. `GetWaitingJobsAsync` filters by application name, sorts by `Priority DESC, TryCount ASC, NextTryTime ASC`, and caps results at `maxResultCount`:
+The default implementation keeps jobs in a `ConcurrentDictionary<Guid, BackgroundJobInfo>`. `GetWaitingJobsAsync` filters by application name, sorts by `Priority DESC, TryCount ASC, NextTryTime ASC`, and caps results at `maxResultCount`:
 
 ```csharp
 public virtual Task<List<BackgroundJobInfo>> GetWaitingJobsAsync(
@@ -65,11 +67,13 @@ public virtual Task<List<BackgroundJobInfo>> GetWaitingJobsAsync(
 }
 ```
 
-Replace this with a persistent store (e.g., EF Core) by implementing `IBackgroundJobStore` and registering it in DI.
+`UpdateAsync` in `InMemoryBackgroundJobStore` checks `IsAbandoned`: if the job is abandoned it simply removes it from the dictionary (calls `DeleteAsync`); otherwise it is a no-op since in-memory state is already mutated in place.
+
+Replace the in-memory store with a persistent store (e.g., EF Core) by implementing `IBackgroundJobStore` and registering it in DI.
 
 ### DefaultBackgroundJobManager
 
-When using the built-in job system (not Hangfire/Quartz), `DefaultBackgroundJobManager` serializes args and writes a `BackgroundJobInfo` record to `IBackgroundJobStore`:
+When using the built-in job system (not Hangfire/Quartz), `DefaultBackgroundJobManager` serializes args and writes a `BackgroundJobInfo` record to `IBackgroundJobStore`. The `NextTryTime` is set to `Clock.Now` by default and overridden only if a `delay` is provided:
 
 ```csharp
 [Dependency(ReplaceServices = true)]
@@ -81,6 +85,15 @@ public class DefaultBackgroundJobManager : IBackgroundJobManager, ITransientDepe
         TimeSpan? delay = null)
     {
         var jobName = BackgroundJobOptions.Value.GetBackgroundJobName(typeof(TArgs));
+        var jobId = await EnqueueAsync(jobName, args!, priority, delay);
+        return jobId.ToString();
+    }
+
+    protected virtual async Task<Guid> EnqueueAsync(
+        string jobName, object args,
+        BackgroundJobPriority priority = BackgroundJobPriority.Normal,
+        TimeSpan? delay = null)
+    {
         var jobInfo = new BackgroundJobInfo
         {
             Id = GuidGenerator.Create(),
@@ -89,24 +102,31 @@ public class DefaultBackgroundJobManager : IBackgroundJobManager, ITransientDepe
             JobArgs = Serializer.Serialize(args),
             Priority = priority,
             CreationTime = Clock.Now,
-            NextTryTime = delay.HasValue ? Clock.Now.Add(delay.Value) : Clock.Now
+            NextTryTime = Clock.Now
         };
+
+        if (delay.HasValue)
+        {
+            jobInfo.NextTryTime = Clock.Now.Add(delay.Value);
+        }
+
         await Store.InsertAsync(jobInfo);
-        return jobInfo.Id.ToString();
+        return jobInfo.Id;
     }
 }
 ```
 
 ### BackgroundJobWorker: The Polling Loop
 
-`BackgroundJobWorker` extends `AsyncPeriodicBackgroundWorkerBase` and drives the execution cycle. On every tick (`JobPollPeriod`, default 5 s) it:
+`BackgroundJobWorker` extends `AsyncPeriodicBackgroundWorkerBase` and drives the execution cycle. On every tick (`JobPollPeriod`, default 5 000 ms) it:
 
-1. Attempts to acquire a distributed lock (`IAbpDistributedLock`)  
-2. Fetches at most `MaxJobFetchCount` (default 1000) waiting jobs from `IBackgroundJobStore`  
-3. Deserializes args and calls `IBackgroundJobExecuter.ExecuteAsync`  
-4. On success: deletes the job record  
-5. On `BackgroundJobExecutionException`: calculates a back-off time via `CalculateNextTryTime` and updates the record  
-6. On hard error: marks the job as `IsAbandoned`
+1. Attempts to acquire a distributed lock (`IAbpDistributedLock`) using `WorkerOptions.DistributedLockName`
+2. Fetches at most `MaxJobFetchCount` (default 1 000) waiting jobs from `IBackgroundJobStore`
+3. For each job: increments `TryCount`, sets `LastTryTime = clock.Now`
+4. Deserializes args and calls `IBackgroundJobExecuter.ExecuteAsync`
+5. On success: calls `store.DeleteAsync(jobInfo.Id)`
+6. On `BackgroundJobExecutionException`: calculates a back-off time via `CalculateNextTryTime` and calls `TryUpdateAsync`
+7. On other hard errors: sets `IsAbandoned = true` and calls `TryUpdateAsync`
 
 ```csharp
 protected override async Task DoWorkAsync(PeriodicBackgroundWorkerContext workerContext)
@@ -118,20 +138,33 @@ protected override async Task DoWorkAsync(PeriodicBackgroundWorkerContext worker
         {
             var store = workerContext.ServiceProvider
                 .GetRequiredService<IBackgroundJobStore>();
+
             var waitingJobs = await store.GetWaitingJobsAsync(
                 WorkerOptions.ApplicationName, WorkerOptions.MaxJobFetchCount);
+
+            if (!waitingJobs.Any())
+            {
+                return;
+            }
+
+            var jobExecuter = workerContext.ServiceProvider
+                .GetRequiredService<IBackgroundJobExecuter>();
             // ... execute each job ...
         }
         else
         {
-            // Another instance holds the lock; sleep 12x the poll period
-            await Task.Delay(WorkerOptions.JobPollPeriod * 12, StoppingToken);
+            // Another instance holds the lock; sleep 12× the poll period
+            try
+            {
+                await Task.Delay(WorkerOptions.JobPollPeriod * 12, StoppingToken);
+            }
+            catch (TaskCanceledException) { }
         }
     }
 }
 ```
 
-The distributed lock prevents multiple application instances from processing the same jobs concurrently.
+The distributed lock prevents multiple application instances from processing the same jobs concurrently. `StoppingToken` is inherited from `BackgroundWorkerBase` and is cancelled when the application shuts down.
 
 ### Retry Back-off Algorithm
 
@@ -148,7 +181,7 @@ protected virtual DateTime? CalculateNextTryTime(BackgroundJobInfo jobInfo, IClo
 
     if (nextTryDate.Subtract(jobInfo.CreationTime).TotalSeconds > WorkerOptions.DefaultTimeout)
     {
-        return null; // abandon
+        return null; // caller sets IsAbandoned = true
     }
     return nextTryDate;
 }
@@ -156,20 +189,22 @@ protected virtual DateTime? CalculateNextTryTime(BackgroundJobInfo jobInfo, IClo
 
 | Option | Default | Description |
 |---|---|---|
-| `JobPollPeriod` | 5000 ms | Polling interval |
-| `MaxJobFetchCount` | 1000 | Jobs fetched per tick |
+| `JobPollPeriod` | 5 000 ms | Polling interval |
+| `MaxJobFetchCount` | 1 000 | Jobs fetched per tick |
 | `DefaultFirstWaitDuration` | 60 s | First retry wait |
 | `DefaultWaitFactor` | 2.0 | Exponential back-off multiplier |
-| `DefaultTimeout` | 172800 s (2 days) | Max age before abandon |
+| `DefaultTimeout` | 172 800 s (2 days) | Max age before abandon |
+| `DistributedLockName` | `"AbpBackgroundJobWorker"` | Distributed lock key |
 
 ### BackgroundJobExecuter
 
-`BackgroundJobExecuter` resolves the job type from DI, reflects on `Execute` or `ExecuteAsync`, and invokes it inside the correct tenant context (reads `TenantId` from `IMultiTenant` job args if available):
+`BackgroundJobExecuter` resolves the job type from DI, reflects on `Execute` or `ExecuteAsync`, and invokes it inside the correct tenant context. The tenant is taken from `IMultiTenant.TenantId` if the job args implement `IMultiTenant`; otherwise it falls back to `CurrentTenant.Id`:
 
 ```csharp
 public virtual async Task ExecuteAsync(JobExecutionContext context)
 {
     var job = context.ServiceProvider.GetService(context.JobType);
+
     var jobExecuteMethod =
         context.JobType.GetMethod(nameof(IBackgroundJob<object>.Execute)) ??
         context.JobType.GetMethod(nameof(IAsyncBackgroundJob<object>.ExecuteAsync));
@@ -179,11 +214,20 @@ public virtual async Task ExecuteAsync(JobExecutionContext context)
         // invoke synchronous or asynchronous execute method
     }
 }
+
+protected virtual Guid? GetJobArgsTenantId(object jobArgs)
+{
+    return jobArgs switch
+    {
+        IMultiTenant multiTenantJobArgs => multiTenantJobArgs.TenantId,
+        _ => CurrentTenant.Id
+    };
+}
 ```
 
 ### NullBackgroundJobManager
 
-`NullBackgroundJobManager` is registered with `[Dependency(TryRegister = true)]`, meaning it is only used when no other `IBackgroundJobManager` is registered. It throws an exception on `EnqueueAsync`, signaling that no real provider is configured. Use `IBackgroundJobManager.IsAvailable()` to guard optional queue usage.
+`NullBackgroundJobManager` is registered with `[Dependency(TryRegister = true)]`, meaning it is only used when no other `IBackgroundJobManager` is registered. It throws an `AbpException` on `EnqueueAsync`, signaling that no real provider is configured. Use `IBackgroundJobManager.IsAvailable()` to guard optional queue usage.
 
 ---
 
@@ -236,20 +280,41 @@ Background workers are **long-running singletons** that start with the applicati
 ### IBackgroundWorker
 
 ```csharp
-// IRunnable extends IHostedService
+// IRunnable extends IHostedService-like StartAsync/StopAsync
 public interface IBackgroundWorker : IRunnable, ISingletonDependency { }
 ```
 
 Workers are registered as singletons and managed by `BackgroundWorkerManager`, which calls `StartAsync` / `StopAsync` on each.
 
+### BackgroundWorkerBase
+
+`BackgroundWorkerBase` is the root base class for all workers. It provides `StoppingTokenSource` and `StoppingToken` (a `CancellationToken` that is cancelled when `StopAsync` is called), a lazy-resolved logger, and default lifecycle logging:
+
+```csharp
+public abstract class BackgroundWorkerBase : IBackgroundWorker
+{
+    protected CancellationTokenSource StoppingTokenSource { get; set; }
+    protected CancellationToken StoppingToken { get; set; }
+
+    public virtual Task StartAsync(CancellationToken cancellationToken = default) { ... }
+    public virtual Task StopAsync(CancellationToken cancellationToken = default)
+    {
+        StoppingTokenSource.Cancel();
+        StoppingTokenSource.Dispose();
+        return Task.CompletedTask;
+    }
+}
+```
+
 ### PeriodicBackgroundWorkerBase
 
-The synchronous variant uses an `AbpTimer` (a wrapper around a `System.Threading.Timer`) that fires `Timer_Elapsed` on each tick. Override `DoWork`:
+The synchronous variant uses an `AbpTimer` (a wrapper around `System.Threading.Timer`) that fires `Timer_Elapsed` on each tick. Each tick creates a new DI scope. Override `DoWork`:
 
 ```csharp
 public abstract class PeriodicBackgroundWorkerBase : BackgroundWorkerBase
 {
     protected AbpTimer Timer { get; }
+    public int Period => Timer.Period;
     public string? CronExpression { get; protected set; }
 
     protected abstract void DoWork(PeriodicBackgroundWorkerContext workerContext);
@@ -258,18 +323,25 @@ public abstract class PeriodicBackgroundWorkerBase : BackgroundWorkerBase
 
 ### AsyncPeriodicBackgroundWorkerBase
 
-The async variant wraps `AbpAsyncTimer` (task-based timer). Override `DoWorkAsync`:
+The async variant wraps `AbpAsyncTimer` (task-based timer). Each tick creates its own DI scope, catches exceptions, and notifies `IExceptionNotifier`. Override `DoWorkAsync`:
 
 ```csharp
 public abstract class AsyncPeriodicBackgroundWorkerBase : BackgroundWorkerBase
 {
     protected AbpAsyncTimer Timer { get; }
+    protected CancellationToken StartCancellationToken { get; set; }
+    public int Period => Timer.Period;
+    public string? CronExpression { get; protected set; }
 
     protected abstract Task DoWorkAsync(PeriodicBackgroundWorkerContext workerContext);
 }
 ```
 
 `BackgroundJobWorker` itself extends `AsyncPeriodicBackgroundWorkerBase`, making it a worker that drives the job polling loop.
+
+### CronExpression Support
+
+Both `PeriodicBackgroundWorkerBase` and `AsyncPeriodicBackgroundWorkerBase` expose a `CronExpression` property. When set it takes priority over the `Period` value, allowing cron-style scheduling without requiring a full Quartz integration.
 
 ### Registering Workers
 
@@ -282,7 +354,7 @@ public override async Task OnApplicationInitializationAsync(
 }
 ```
 
-`AddBackgroundWorkerAsync` resolves the worker from DI and calls `BackgroundWorkerManager.AddAsync`.
+`AddBackgroundWorkerAsync` resolves the worker from DI and calls `BackgroundWorkerManager.AddAsync`. If `BackgroundWorkerManager.IsRunning` is already true (the application started before the worker was added), `StartAsync` is called immediately.
 
 ### Architecture Diagram
 
@@ -300,15 +372,16 @@ flowchart TD
         DL[Acquire DistributedLock] --> FETCH[GetWaitingJobs]
         FETCH --> EXEC[IBackgroundJobExecuter.ExecuteAsync]
         EXEC -->|Success| DEL[store.DeleteAsync]
-        EXEC -->|Failure| RETRY[CalculateNextTryTime → UpdateAsync]
-        RETRY -->|Timeout| ABANDON[IsAbandoned = true]
+        EXEC -->|BackgroundJobExecutionException| RETRY[CalculateNextTryTime → TryUpdateAsync]
+        EXEC -->|Other exception| ABANDON[IsAbandoned = true → TryUpdateAsync]
+        RETRY -->|Timeout exceeded| ABANDON
     end
 
     IMSTORE --> PollingLoop
 ```
 
 <Note>
-`CronExpression` on `PeriodicBackgroundWorkerBase` takes priority over `Period` when set. This allows cron-style scheduling without a full Quartz integration.
+`CronExpression` on both `PeriodicBackgroundWorkerBase` and `AsyncPeriodicBackgroundWorkerBase` takes priority over `Period` when set. This allows cron-style scheduling without a full Quartz integration.
 </Note>
 
 <Warning>

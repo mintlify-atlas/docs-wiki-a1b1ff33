@@ -10,13 +10,13 @@ ABP extends ASP.NET Core's authorization infrastructure with a permission system
 
 <CardGroup cols={2}>
   <Card title="IAbpAuthorizationService" icon="shield-check">
-    Extends `IAuthorizationService` with `CurrentPrincipal`. ABP replaces the default ASP.NET Core implementation with `AbpAuthorizationService`, which sources the principal from `ICurrentPrincipalAccessor` so it works correctly outside an HTTP context.
+    Extends both `IAuthorizationService` and `IServiceProviderAccessor`. ABP replaces the default ASP.NET Core implementation with `AbpAuthorizationService`, which sources the principal from `ICurrentPrincipalAccessor` via the `CurrentPrincipal` property so it works correctly outside an HTTP context.
   </Card>
   <Card title="IPermissionChecker" icon="list-check">
     The primary runtime check interface. Accepts a permission name (or an array) plus an optional `ClaimsPrincipal` override. Returns `bool` or `MultiplePermissionGrantResult`.
   </Card>
   <Card title="PermissionDefinition" icon="code">
-    Metadata describing a single permission: unique `Name`, `DisplayName`, `MultiTenancySide`, hierarchical `Children`, allowed `Providers`, and arbitrary `Properties`.
+    Metadata describing a single permission: unique `Name`, `DisplayName`, `MultiTenancySide`, hierarchical `Children`, allowed `Providers`, `StateCheckers`, and arbitrary `Properties`. Also carries optional `ResourceName` and `ManagementPermissionName` for resource-based permissions.
   </Card>
   <Card title="IPermissionValueProvider" icon="plug">
     The extension point for reading grant values. Each provider has a short `Name` used for storage keying and implements `CheckAsync` returning `PermissionGrantResult` (Granted / Prohibited / Undefined).
@@ -29,6 +29,7 @@ ABP extends ASP.NET Core's authorization infrastructure with a permission system
 classDiagram
     direction LR
     IAuthorizationService <|-- IAbpAuthorizationService
+    IServiceProviderAccessor <|-- IAbpAuthorizationService
     DefaultAuthorizationService <|-- AbpAuthorizationService
     IAbpAuthorizationService <|.. AbpAuthorizationService
     AbpInterceptor <|-- AuthorizationInterceptor
@@ -81,9 +82,32 @@ public class BookStorePermissionDefinitionProvider : PermissionDefinitionProvide
 A child permission can only be granted if its parent is already granted.  
 `PermissionDefinition.Providers` restricts which value providers are consulted. An empty list means all providers are allowed.
 
+### PermissionDefinition Properties
+
+```csharp
+public class PermissionDefinition :
+    IHasSimpleStateCheckers<PermissionDefinition>,
+    ICanAddChildPermission
+{
+    public string Name { get; }
+    public string? ResourceName { get; set; }          // for resource-based permissions
+    public string? ManagementPermissionName { get; set; }
+    public PermissionDefinition? Parent { get; }
+    public MultiTenancySides MultiTenancySide { get; set; }
+    public List<string> Providers { get; }             // empty = all providers allowed
+    public List<ISimpleStateChecker<PermissionDefinition>> StateCheckers { get; }
+    public ILocalizableString DisplayName { get; set; }
+    public IReadOnlyList<PermissionDefinition> Children { get; }
+    public Dictionary<string, object?> Properties { get; }
+    public bool IsEnabled { get; set; }                // default: true
+}
+```
+
+`StateCheckers` allow attaching `ISimpleStateChecker<PermissionDefinition>` implementations that can dynamically enable/disable a permission at evaluation time based on application state (e.g., feature flags).
+
 ## Permission Value Providers
 
-`SettingProvider` iterates `ISettingValueProviderManager.Providers` **in reverse order**, meaning the highest-priority provider wins. ABP registers three built-in providers out of the box:
+The permission evaluator iterates `IPermissionValueProviderManager.Providers` **in reverse order** (highest-priority provider wins). ABP registers three built-in providers out of the box:
 
 | Provider | `Name` constant | What it checks |
 |---|---|---|

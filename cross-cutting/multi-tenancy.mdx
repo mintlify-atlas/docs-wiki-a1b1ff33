@@ -68,11 +68,11 @@ public virtual async Task<TenantResolveResult> ResolveTenantIdOrNameAsync()
         }
     }
 
-    // Fallback if configured
     if (result.TenantIdOrName.IsNullOrEmpty()
         && !string.IsNullOrWhiteSpace(Options.FallbackTenant))
     {
         result.TenantIdOrName = Options.FallbackTenant;
+        result.AppliedResolvers.Add(TenantResolverNames.FallbackTenant);
     }
 
     return result;
@@ -182,8 +182,8 @@ public class CurrentTenant : ICurrentTenant, ITransientDependency
         return new DisposeAction<ValueTuple<ICurrentTenantAccessor, BasicTenantInfo?>>(
             static (state) =>
             {
-                var (accessor, parent) = state;
-                accessor.Current = parent;
+                var (currentTenantAccessor, parentScope) = state;
+                currentTenantAccessor.Current = parentScope;
             },
             (_currentTenantAccessor, parentScope)
         );
@@ -208,6 +208,22 @@ using (_currentTenant.Change(null))
     var globalConfig = await _settingProvider.GetOrNullAsync("App.Theme");
 }
 ```
+
+## ICurrentTenant Interface
+
+The full `ICurrentTenant` contract:
+
+```csharp
+public interface ICurrentTenant
+{
+    bool IsAvailable { get; }   // true when Id has a value (tenant context active)
+    Guid? Id { get; }
+    string? Name { get; }
+    IDisposable Change(Guid? id, string? name = null);
+}
+```
+
+`IsAvailable` returns `false` when running in the host context (`Id == null`). Use it as a guard before accessing tenant-specific resources.
 
 ## Per-Tenant Connection Strings
 

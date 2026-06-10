@@ -51,11 +51,13 @@ classDiagram
     class Entity {
         <<abstract>>
         +GetKeys() object?[]
+        +GetObjectKey() string?
         +EntityEquals(IEntity) bool
     }
     class Entity_TKey {
         <<abstract>>
         +Id: TKey
+        +GetKeys() object?[]
     }
     class BasicAggregateRoot {
         <<abstract>>
@@ -63,9 +65,15 @@ classDiagram
         -_distributedEvents
         +AddLocalEvent(object)
         +AddDistributedEvent(object)
+        +ClearLocalEvents()
+        +ClearDistributedEvents()
     }
     class BasicAggregateRoot_TKey {
         <<abstract>>
+        +AddLocalEvent(object)
+        +AddDistributedEvent(object)
+        +ClearLocalEvents()
+        +ClearDistributedEvents()
     }
     class AggregateRoot {
         <<abstract>>
@@ -75,6 +83,9 @@ classDiagram
     }
     class AggregateRoot_TKey {
         <<abstract>>
+        +ExtraProperties: ExtraPropertyDictionary
+        +ConcurrencyStamp: string
+        +Validate(ValidationContext)
     }
     class CreationAuditedAggregateRoot_TKey {
         <<abstract>>
@@ -126,7 +137,7 @@ classDiagram
 
 ## `IEntity` and `Entity<TKey>`
 
-`IEntity` extends `IKeyedObject` and requires a single method:
+`IEntity` extends `IKeyedObject` and requires a single method. `IEntity<TKey>` adds a strongly-typed `Id` property:
 
 ```csharp
 // Volo.Abp.Domain.Entities
@@ -141,13 +152,46 @@ public interface IEntity<TKey> : IEntity
 }
 ```
 
-The abstract class `Entity` implements `IEntity` and wires up multi-tenancy bootstrapping in its constructor via `EntityHelper.TrySetTenantId(this)`. The typed variant `Entity<TKey>` adds the strongly-typed `Id` property and a single-element `GetKeys()` implementation:
+The abstract class `Entity` implements `IEntity` and wires up multi-tenancy bootstrapping in its constructor via `EntityHelper.TrySetTenantId(this)`. It also provides `GetObjectKey()` (which encodes composite keys as a string) and `EntityEquals()`:
+
+```csharp
+[Serializable]
+public abstract class Entity : IEntity
+{
+    protected Entity()
+    {
+        EntityHelper.TrySetTenantId(this);
+    }
+
+    public virtual string? GetObjectKey()
+    {
+        var keys = GetKeys();
+        return keys.Length switch
+        {
+            0 => null,
+            1 when keys[0] != null => keys[0]?.ToString(),
+            _ => KeyedObjectHelper.EncodeCompositeKey(keys)
+        };
+    }
+
+    public abstract object?[] GetKeys();
+
+    public bool EntityEquals(IEntity other)
+    {
+        return EntityHelper.EntityEquals(this, other);
+    }
+}
+```
+
+The typed variant `Entity<TKey>` adds the strongly-typed `Id` property and a single-element `GetKeys()` implementation:
 
 ```csharp
 [Serializable]
 public abstract class Entity<TKey> : Entity, IEntity<TKey>
 {
     public virtual TKey Id { get; protected set; } = default!;
+
+    protected Entity() { }
 
     protected Entity(TKey id)
     {
@@ -172,7 +216,7 @@ Child objects that are **not** aggregate roots — for example, `IdentityUserCla
 
 ## `BasicAggregateRoot<TKey>` — domain events without extra properties
 
-`BasicAggregateRoot<TKey>` bridges `Entity<TKey>` and the `IGeneratesDomainEvents` contract. It maintains two private, lazily initialised collections of `DomainEventRecord` objects — one for in-process local events and one for distributed events:
+`BasicAggregateRoot<TKey>` bridges `Entity<TKey>` and the `IGeneratesDomainEvents` contract. It maintains two private, lazily-initialised collections of `DomainEventRecord` objects — one for in-process local events and one for distributed events:
 
 ```csharp
 [Serializable]
@@ -183,11 +227,25 @@ public abstract class BasicAggregateRoot<TKey> : Entity<TKey>,
     private ICollection<DomainEventRecord>? _distributedEvents;
     private ICollection<DomainEventRecord>? _localEvents;
 
+    protected BasicAggregateRoot() { }
+
+    protected BasicAggregateRoot(TKey id) : base(id) { }
+
     public virtual IEnumerable<DomainEventRecord> GetLocalEvents()
         => _localEvents ?? Array.Empty<DomainEventRecord>();
 
     public virtual IEnumerable<DomainEventRecord> GetDistributedEvents()
         => _distributedEvents ?? Array.Empty<DomainEventRecord>();
+
+    public virtual void ClearLocalEvents()
+    {
+        _localEvents?.Clear();
+    }
+
+    public virtual void ClearDistributedEvents()
+    {
+        _distributedEvents?.Clear();
+    }
 
     protected virtual void AddLocalEvent(object eventData)
     {
@@ -202,6 +260,8 @@ public abstract class BasicAggregateRoot<TKey> : Entity<TKey>,
     }
 }
 ```
+
+There is also a non-generic `BasicAggregateRoot` (no `TKey`) for composite-key aggregates, with the same domain event infrastructure, inheriting from `Entity` rather than `Entity<TKey>`.
 
 <Tip>
 Use `BasicAggregateRoot<TKey>` when your aggregate root must **not** carry extra properties or a concurrency stamp — for example, a high-throughput log entry that should stay as thin as possible.
@@ -243,6 +303,8 @@ public abstract class AggregateRoot<TKey> : BasicAggregateRoot<TKey>,
 }
 ```
 
+There is also a non-generic `AggregateRoot` that extends `BasicAggregateRoot` (the non-generic variant) and adds the same `ExtraProperties`, `ConcurrencyStamp`, and `Validate` members for composite-key scenarios.
+
 ### `IHasExtraProperties` — the extensible property bag
 
 `ExtraPropertyDictionary` is a `Dictionary<string, object?>` that is persisted as a JSON column (EF Core) or a sub-document field (MongoDB). It lets modules and application code add new fields to an entity **without changing its schema or recompiling** the defining assembly.
@@ -270,6 +332,7 @@ Do **not** set `ConcurrencyStamp` manually. The repository provider updates it a
 Domain events are plain POCO objects enqueued inside an aggregate by calling `AddLocalEvent` or `AddDistributedEvent`. The Unit of Work infrastructure harvests them after `SaveChangesAsync` succeeds.
 
 ```csharp
+// Volo.Abp.Domain.Entities
 public class DomainEventRecord
 {
     public object EventData { get; }
@@ -284,6 +347,18 @@ public class DomainEventRecord
 ```
 
 `EventOrder` comes from `EventOrderGenerator.GetNext()` — a monotonically increasing `long` that preserves cross-aggregate ordering within a single Unit of Work.
+
+The `IGeneratesDomainEvents` interface defines the full contract implemented by `BasicAggregateRoot`:
+
+```csharp
+public interface IGeneratesDomainEvents
+{
+    IEnumerable<DomainEventRecord> GetLocalEvents();
+    IEnumerable<DomainEventRecord> GetDistributedEvents();
+    void ClearLocalEvents();
+    void ClearDistributedEvents();
+}
+```
 
 After the Unit of Work commits, the `EntityChangeEventHelper` collects all `DomainEventEntry` objects (wrapping the source entity, event data, and order) into an `EntityEventReport` and dispatches them through the in-process event bus. Distributed events are forwarded to the configured message broker.
 
@@ -302,13 +377,27 @@ sequenceDiagram
     UoW->>Bus: Publish distributed Events
 ```
 
+### Built-in entity lifecycle events
+
+ABP automatically raises typed event data objects for entity changes. `EntityCreatedEventData<TEntity>` (in `Volo.Abp.Domain.Entities.Events`) is one example:
+
+```csharp
+[Serializable]
+public class EntityCreatedEventData<TEntity> : EntityChangedEventData<TEntity>
+{
+    public EntityCreatedEventData(TEntity entity) : base(entity) { }
+}
+```
+
+Parallel types exist for updates and deletions (`EntityUpdatedEventData<TEntity>`, `EntityDeletedEventData<TEntity>`). These are raised automatically by the change-event infrastructure — you do not need to call `AddLocalEvent` for them unless you want custom event data.
+
 ## Auditing base classes
 
 ABP provides a stack of convenience aggregate root base classes that automatically record who created, modified, or deleted an entity. These are all defined in `Volo.Abp.Domain.Entities.Auditing`.
 
 <CardGroup cols={2}>
   <Card title="CreationAuditedAggregateRoot&lt;TKey&gt;" icon="circle-plus">
-    Adds `CreationTime` (`DateTime`) and `CreatorId` (`Guid?`). Populated automatically by the `CreationAuditedEntityInterceptor`.
+    Adds `CreationTime` (`DateTime`) and `CreatorId` (`Guid?`). Populated automatically by the auditing interceptor.
   </Card>
   <Card title="AuditedAggregateRoot&lt;TKey&gt;" icon="pen-to-square">
     Extends creation auditing with `LastModificationTime` (`DateTime?`) and `LastModifierId` (`Guid?`).
@@ -321,21 +410,41 @@ ABP provides a stack of convenience aggregate root base classes that automatical
   </Card>
 </CardGroup>
 
+Each audited class also has a non-generic counterpart (`CreationAuditedAggregateRoot`, `AuditedAggregateRoot`, `FullAuditedAggregateRoot`) for composite-key aggregates.
+
+### Auditing property visibility
+
+Note that in `CreationAuditedAggregateRoot<TKey>`, auditing properties have **public** setters (not `protected`), since the auditing infrastructure sets them from outside the entity:
+
+```csharp
+public abstract class CreationAuditedAggregateRoot<TKey> : AggregateRoot<TKey>, ICreationAuditedObject
+{
+    public virtual DateTime CreationTime { get; set; }
+    public virtual Guid? CreatorId { get; set; }
+}
+```
+
 ### `ISoftDelete`
 
 `FullAuditedAggregateRoot<TKey>` implements `IFullAuditedObject` which in turn implements `ISoftDelete`. When the `ISoftDelete` data filter is enabled (the default), `RepositoryBase.ApplyDataFilters` appends a `WHERE IsDeleted = false` clause to every query:
 
 ```csharp
-protected virtual TQueryable ApplyDataFilters<TQueryable>(TQueryable query)
-    where TQueryable : IQueryable<TEntity>
+protected virtual TQueryable ApplyDataFilters<TQueryable, TOtherEntity>(TQueryable query)
+    where TQueryable : IQueryable<TOtherEntity>
 {
-    if (typeof(ISoftDelete).IsAssignableFrom(typeof(TEntity)))
+    if (typeof(ISoftDelete).IsAssignableFrom(typeof(TOtherEntity)))
     {
         query = (TQueryable)query.WhereIf(
             DataFilter.IsEnabled<ISoftDelete>(),
             e => ((ISoftDelete)e!).IsDeleted == false);
     }
-    // ...
+    if (typeof(IMultiTenant).IsAssignableFrom(typeof(TOtherEntity)))
+    {
+        var tenantId = CurrentTenant.Id;
+        query = (TQueryable)query.WhereIf(
+            DataFilter.IsEnabled<IMultiTenant>(),
+            e => ((IMultiTenant)e!).TenantId == tenantId);
+    }
     return query;
 }
 ```
@@ -353,6 +462,17 @@ protected virtual TQueryable ApplyDataFilters<TQueryable>(TQueryable query)
     Choose the appropriate audited base class: `CreationAuditedAggregateRoot<TKey>` → `AuditedAggregateRoot<TKey>` → `FullAuditedAggregateRoot<TKey>` depending on how much audit trail the aggregate requires.
   </Step>
 </Steps>
+
+### Base class quick reference
+
+| Base class | Key | ExtraProps | ConcurrencyStamp | DomainEvents | CreationTime | ModificationTime | SoftDelete |
+|---|---|---|---|---|---|---|---|
+| `Entity<TKey>` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `BasicAggregateRoot<TKey>` | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ |
+| `AggregateRoot<TKey>` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `CreationAuditedAggregateRoot<TKey>` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| `AuditedAggregateRoot<TKey>` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| `FullAuditedAggregateRoot<TKey>` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 A real example from the Identity module:
 

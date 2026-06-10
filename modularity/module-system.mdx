@@ -8,10 +8,10 @@ The ABP module system is the mechanism by which an application is composed from 
 
 ## `IAbpModule` — The Minimal Contract
 
-The simplest possible ABP module needs only to implement `IAbpModule`:
+The simplest possible ABP module needs only to implement `IAbpModule`
+(`Volo.Abp.Core/Volo/Abp/Modularity/IAbpModule.cs`):
 
 ```csharp
-// IAbpModule.cs
 public interface IAbpModule
 {
     Task ConfigureServicesAsync(ServiceConfigurationContext context);
@@ -23,10 +23,9 @@ The sync and async overloads coexist so that existing synchronous code does not 
 
 ## `AbpModule` — The Concrete Base Class
 
-`AbpModule` is the class every real module inherits. It implements all six lifecycle interfaces and provides helper methods for `IOptions<T>` configuration:
+`AbpModule` (`Volo.Abp.Core/Volo/Abp/Modularity/AbpModule.cs`) is the class every real module inherits. It implements all six lifecycle interfaces and provides helper methods for `IOptions<T>` configuration:
 
 ```csharp
-// AbpModule.cs (abbreviated)
 public abstract class AbpModule :
     IAbpModule,
     IOnPreApplicationInitialization,
@@ -38,17 +37,26 @@ public abstract class AbpModule :
 {
     protected internal bool SkipAutoServiceRegistration { get; protected set; }
 
-    protected internal ServiceConfigurationContext ServiceConfigurationContext { ... }
+    protected internal ServiceConfigurationContext ServiceConfigurationContext { get; internal set; }
 
     public virtual void ConfigureServices(ServiceConfigurationContext context) { }
+    public virtual Task ConfigureServicesAsync(ServiceConfigurationContext context) { ... }
     public virtual void PreConfigureServices(ServiceConfigurationContext context) { }
+    public virtual Task PreConfigureServicesAsync(ServiceConfigurationContext context) { ... }
     public virtual void PostConfigureServices(ServiceConfigurationContext context) { }
+    public virtual Task PostConfigureServicesAsync(ServiceConfigurationContext context) { ... }
     public virtual void OnPreApplicationInitialization(ApplicationInitializationContext context) { }
+    public virtual Task OnPreApplicationInitializationAsync(ApplicationInitializationContext context) { ... }
     public virtual void OnApplicationInitialization(ApplicationInitializationContext context) { }
+    public virtual Task OnApplicationInitializationAsync(ApplicationInitializationContext context) { ... }
     public virtual void OnPostApplicationInitialization(ApplicationInitializationContext context) { }
+    public virtual Task OnPostApplicationInitializationAsync(ApplicationInitializationContext context) { ... }
     public virtual void OnApplicationShutdown(ApplicationShutdownContext context) { }
+    public virtual Task OnApplicationShutdownAsync(ApplicationShutdownContext context) { ... }
 }
 ```
+
+For every async override, `AbpModule` provides a default implementation that calls the synchronous version and returns `Task.CompletedTask`. Module authors override either the sync or the async form — they need not override both.
 
 ### `ServiceConfigurationContext` Access Guard
 
@@ -70,23 +78,58 @@ protected internal ServiceConfigurationContext ServiceConfigurationContext {
 }
 ```
 
+`AbpApplicationBase.ConfigureServicesAsync` sets `ServiceConfigurationContext` on each module instance before calling the configuration phase, and resets it to `null!` after `PostConfigureServices` completes. Any field or property that stores a reference to `ServiceConfigurationContext` for later use will observe `null` after startup.
+
 ### `SkipAutoServiceRegistration`
 
-Setting `SkipAutoServiceRegistration = true` in a module prevents `AbpApplicationBase.ConfigureServicesAsync` from calling `services.AddAssembly(assembly)` for that module's assemblies. This is useful for framework modules that manage their own registration.
+Setting `SkipAutoServiceRegistration = true` in a module's constructor prevents `AbpApplicationBase.ConfigureServicesAsync` from calling `services.AddAssembly(assembly)` for that module's assemblies. Specifically, the loop in `AbpApplicationBase` is:
+
+```csharp
+if (!abpModule.SkipAutoServiceRegistration)
+{
+    foreach (var assembly in module.AllAssemblies)
+    {
+        if (!assemblies.Contains(assembly))
+        {
+            Services.AddAssembly(assembly);
+            assemblies.Add(assembly);
+        }
+    }
+}
+```
+
+This flag is useful for framework modules that register their services through other means (e.g., manually calling `AddXxx` extension methods) and want to avoid double-registration from the conventional registrar.
 
 ### `Configure<TOptions>` Helpers
 
-`AbpModule` wraps `IServiceCollection.Configure<TOptions>` so module authors call `Configure<MyOptions>(o => ...)` without needing to reference `ServiceConfigurationContext.Services` directly:
+`AbpModule` wraps `IServiceCollection.Configure<TOptions>` so module authors can call `Configure<MyOptions>(o => ...)` without needing to reference `ServiceConfigurationContext.Services` directly. Five overloads are provided:
 
 ```csharp
+// Action-based
 protected void Configure<TOptions>(Action<TOptions> configureOptions)
     where TOptions : class
 {
     ServiceConfigurationContext.Services.Configure(configureOptions);
 }
+
+// Named options
+protected void Configure<TOptions>(string name, Action<TOptions> configureOptions)
+    where TOptions : class
+
+// IConfiguration binding
+protected void Configure<TOptions>(IConfiguration configuration)
+    where TOptions : class
+
+// IConfiguration + BinderOptions
+protected void Configure<TOptions>(IConfiguration configuration, Action<BinderOptions> configureBinder)
+    where TOptions : class
+
+// Named + IConfiguration
+protected void Configure<TOptions>(string name, IConfiguration configuration)
+    where TOptions : class
 ```
 
-Five overloads cover named options, `IConfiguration` binding, `BinderOptions`, and named+configuration combos.
+`PreConfigure<TOptions>`, `PostConfigure<TOptions>`, and `PostConfigureAll<TOptions>` delegate to the corresponding `IServiceCollection` extension methods in the same way.
 
 ### Static Helpers
 
@@ -101,12 +144,12 @@ public static bool IsAbpModule(Type type)
 }
 ```
 
-`IsAbpModule` is used by `FolderPlugInSource` when scanning assemblies for module types.
+`IsAbpModule` is used by `FolderPlugInSource` and `FilePlugInSource` when scanning assemblies for module types, and by `AbpModule.CheckAbpModuleType` which throws `ArgumentException` if the check fails.
 
 ## `DependsOnAttribute` — Declaring Dependencies
 
 ```csharp
-// DependsOnAttribute.cs
+// Volo.Abp.Core/Volo/Abp/Modularity/DependsOnAttribute.cs
 [AttributeUsage(AttributeTargets.Class, AllowMultiple = true)]
 public class DependsOnAttribute : Attribute, IDependedTypesProvider
 {
@@ -121,7 +164,7 @@ public class DependsOnAttribute : Attribute, IDependedTypesProvider
 }
 ```
 
-The attribute is `AllowMultiple = true`, so a single module can declare multiple `[DependsOn]` attributes. It implements `IDependedTypesProvider`, which means any custom attribute that also implements `IDependedTypesProvider` is treated identically by `AbpModuleHelper.FindDependedModuleTypes`.
+The attribute is `AllowMultiple = true`, so a single module can carry multiple `[DependsOn]` attributes. It implements `IDependedTypesProvider`, which means any custom attribute that also implements `IDependedTypesProvider` is treated identically by `AbpModuleHelper.FindDependedModuleTypes` — enabling custom dependency-declaration conventions.
 
 **Example:**
 
@@ -129,15 +172,40 @@ The attribute is `AllowMultiple = true`, so a single module can declare multiple
 [DependsOn(
     typeof(AbpAspNetCoreMvcModule),
     typeof(BookStoreDomainModule))]
-public class BookStoreWebModule : AbpModule { ... }
+public class BookStoreWebModule : AbpModule { }
 ```
+
+## `AdditionalAssemblyAttribute` — Extra Module Assemblies
+
+A module can declare that additional assemblies belong to it by applying `[AdditionalAssembly]`:
+
+```csharp
+// Volo.Abp.Core/Volo/Abp/Modularity/AdditionalAssemblyAttribute.cs
+[AttributeUsage(AttributeTargets.Class, AllowMultiple = true)]
+public class AdditionalAssemblyAttribute : Attribute, IAdditionalModuleAssemblyProvider
+{
+    public Type[] TypesInAssemblies { get; }
+
+    public AdditionalAssemblyAttribute(params Type[]? typesInAssemblies)
+    {
+        TypesInAssemblies = typesInAssemblies ?? Type.EmptyTypes;
+    }
+
+    public virtual Assembly[] GetAssemblies()
+    {
+        return TypesInAssemblies.Select(t => t.Assembly).Distinct().ToArray();
+    }
+}
+```
+
+`AbpModuleHelper.GetAllAssemblies` collects all `IAdditionalModuleAssemblyProvider` attributes on the module class and returns the union of those assemblies with the module's own primary assembly. This `AllAssemblies` array is stored in `AbpModuleDescriptor` and used by `AbpApplicationBase` to scan each assembly with the conventional registrar.
 
 ## `IAbpModuleDescriptor` — Runtime Representation
 
-Once loaded, every module is represented by an `IAbpModuleDescriptor`:
+Once loaded, every module is represented by an `IAbpModuleDescriptor`
+(`Volo.Abp.Core/Volo/Abp/Modularity/IAbpModuleDescriptor.cs`):
 
 ```csharp
-// IAbpModuleDescriptor.cs
 public interface IAbpModuleDescriptor
 {
     Type Type { get; }
@@ -149,12 +217,10 @@ public interface IAbpModuleDescriptor
 }
 ```
 
-`AllAssemblies` can include additional assemblies declared via `[AdditionalAssembly]` on the module class — the `AbpModuleHelper.GetAllAssemblies` static collects them from `IAdditionalModuleAssemblyProvider` attributes.
-
-The concrete implementation is `AbpModuleDescriptor`:
+The concrete implementation `AbpModuleDescriptor`
+(`Volo.Abp.Core/Volo/Abp/Modularity/AbpModuleDescriptor.cs`) validates its inputs at construction:
 
 ```csharp
-// AbpModuleDescriptor.cs (constructor)
 public AbpModuleDescriptor(Type type, IAbpModule instance, bool isLoadedAsPlugIn)
 {
     Check.NotNull(type, nameof(type));
@@ -170,17 +236,34 @@ public AbpModuleDescriptor(Type type, IAbpModule instance, bool isLoadedAsPlugIn
 }
 ```
 
+`AddDependency(IAbpModuleDescriptor descriptor)` appends to the internal `_dependencies` list using `AddIfNotContains` to prevent duplicate entries. `Dependencies` is exposed as `ImmutableList<IAbpModuleDescriptor>` via `_dependencies.ToImmutableList()`.
+
+## `AbpModuleHelper` — Static Discovery Utilities
+
+`AbpModuleHelper` (`Volo.Abp.Core/Volo/Abp/Modularity/AbpModuleHelper.cs`) provides three static methods:
+
+| Method | Purpose |
+|---|---|
+| `FindAllModuleTypes(Type startupModuleType, ILogger? logger)` | Pre-order depth-first traversal of `[DependsOn]` graph, deduplicating types |
+| `FindDependedModuleTypes(Type moduleType)` | Direct dependency types from all `IDependedTypesProvider` attributes on one module |
+| `GetAllAssemblies(Type moduleType)` | Union of the module's assembly and any `IAdditionalModuleAssemblyProvider`-declared assemblies |
+
+`FindAllModuleTypes` logs each discovered type at `Debug` level with indentation proportional to depth, which is visible in the init log output.
+
 ## `ModuleLoader` — Discovery and Sorting
 
-`ModuleLoader` is the workhorse. Its public surface is `LoadModules`, which delegates to two internal steps:
+`ModuleLoader` (`Volo.Abp.Core/Volo/Abp/Modularity/ModuleLoader.cs`) is the workhorse. Its public entry point is `LoadModules`, which performs two steps:
 
 ```csharp
-// ModuleLoader.cs
 public IAbpModuleDescriptor[] LoadModules(
     IServiceCollection services,
     Type startupModuleType,
     PlugInSourceList plugInSources)
 {
+    Check.NotNull(services, nameof(services));
+    Check.NotNull(startupModuleType, nameof(startupModuleType));
+    Check.NotNull(plugInSources, nameof(plugInSources));
+
     var modules = GetDescriptors(services, startupModuleType, plugInSources);
     modules = SortByDependency(modules, startupModuleType);
     return modules.ToArray();
@@ -202,7 +285,7 @@ private List<IAbpModuleDescriptor> GetDescriptors(
 }
 ```
 
-`FillModules` first calls `AbpModuleHelper.FindAllModuleTypes` which recursively walks `[DependsOn]` attributes depth-first, adding each type only once (deduplication). Then it appends plugin module types from `PlugInSourceList.GetAllModules()`:
+`FillModules` first calls `AbpModuleHelper.FindAllModuleTypes` which traverses the `[DependsOn]` graph from the startup module. Then plugin module types from `PlugInSourceList.GetAllModules()` are appended, skipping duplicates:
 
 ```csharp
 protected virtual void FillModules(
@@ -213,11 +296,13 @@ protected virtual void FillModules(
 {
     var logger = services.GetInitLogger<AbpApplicationBase>();
 
+    // All modules reachable from startupModuleType via [DependsOn]
     foreach (var moduleType in AbpModuleHelper.FindAllModuleTypes(startupModuleType, logger))
     {
         modules.Add(CreateModuleDescriptor(services, moduleType));
     }
 
+    // Plugin modules (deduplicated)
     foreach (var moduleType in plugInSources.GetAllModules(logger))
     {
         if (modules.Any(m => m.Type == moduleType)) { continue; }
@@ -226,7 +311,7 @@ protected virtual void FillModules(
 }
 ```
 
-Each module instance is created and immediately registered as a singleton:
+Each module instance is created with `Activator.CreateInstance` and immediately registered in `IServiceCollection` as a singleton:
 
 ```csharp
 protected virtual IAbpModule CreateAndRegisterModule(IServiceCollection services, Type moduleType)
@@ -237,7 +322,7 @@ protected virtual IAbpModule CreateAndRegisterModule(IServiceCollection services
 }
 ```
 
-`SetDependencies` resolves each descriptor's `Dependencies` list from the already-built descriptor collection, throwing `AbpException` if a declared dependency type was not found.
+`SetDependencies` wires each descriptor's `Dependencies` list from the already-built descriptor collection. If a declared dependency type was not found among the loaded descriptors, it throws `AbpException` with the assembly-qualified names of both the dependent and the missing dependency.
 
 ### Step 2 — `SortByDependency`
 
@@ -252,7 +337,7 @@ protected virtual List<IAbpModuleDescriptor> SortByDependency(
 }
 ```
 
-`SortByDependencies` is an extension method (from `Volo.Abp.Collections`) that implements a topological sort (Kahn's algorithm). After sorting, `MoveItem` guarantees the startup module is always **last** so its hooks execute after all dependencies.
+`SortByDependencies` is an extension method (from `Volo.Abp.Collections`) that implements a topological sort. After sorting, `MoveItem` guarantees the startup module is always **last**, so its lifecycle hooks execute after all of its dependencies.
 
 <Warning>
 Circular dependencies between modules are caught by the topological sort and result in an exception during application startup, not at runtime.
@@ -260,19 +345,18 @@ Circular dependencies between modules are caught by the topological sort and res
 
 ## Plugin Sources
 
-Plugins are loaded through the `PlugInSourceList` collected in `AbpApplicationCreationOptions.PlugInSources`. Two built-in sources ship with `Volo.Abp.Core`:
+Plugins are loaded through the `PlugInSourceList` collected in `AbpApplicationCreationOptions.PlugInSources`. Three built-in sources ship with `Volo.Abp.Core`:
 
 ### `FolderPlugInSource`
 
-Loads all `.dll` files from a directory and extracts any types satisfying `AbpModule.IsAbpModule`:
+`Volo.Abp.Core/Volo/Abp/Modularity/PlugIns/FolderPlugInSource.cs` — loads all `.dll` files from a directory and extracts any types satisfying `AbpModule.IsAbpModule`:
 
 ```csharp
-// FolderPlugInSource.cs
 public class FolderPlugInSource : IPlugInSource
 {
     public string Folder { get; }
-    public SearchOption SearchOption { get; set; }
-    public Func<string, bool>? Filter { get; set; }
+    public SearchOption SearchOption { get; set; }  // TopDirectoryOnly by default
+    public Func<string, bool>? Filter { get; set; } // optional file path filter
 
     public Type[] GetModules()
     {
@@ -299,14 +383,44 @@ public class FolderPlugInSource : IPlugInSource
 }
 ```
 
-Assemblies are loaded via `AssemblyLoadContext.Default`, meaning they share the default ALC and can participate in normal type resolution.
+Assemblies are loaded via `AssemblyLoadContext.Default`, so they share the default ALC and participate in normal type resolution.
+
+### `FilePlugInSource`
+
+`Volo.Abp.Core/Volo/Abp/Modularity/PlugIns/FilePlugInSource.cs` — accepts explicit assembly file paths and loads each via `AssemblyLoadContext.Default.LoadFromAssemblyPath`:
+
+```csharp
+public class FilePlugInSource : IPlugInSource
+{
+    public string[] FilePaths { get; }
+
+    public FilePlugInSource(params string[]? filePaths)
+    {
+        FilePaths = filePaths ?? new string[0];
+    }
+
+    public Type[] GetModules()
+    {
+        var modules = new List<Type>();
+        foreach (var filePath in FilePaths)
+        {
+            var assembly = AssemblyLoadContext.Default.LoadFromAssemblyPath(filePath);
+            foreach (var type in assembly.GetTypes())
+            {
+                if (AbpModule.IsAbpModule(type))
+                    modules.AddIfNotContains(type);
+            }
+        }
+        return modules.ToArray();
+    }
+}
+```
 
 ### `TypePlugInSource`
 
-Accepts explicit module types at construction time — useful in tests or when the plugin assembly is already loaded:
+`Volo.Abp.Core/Volo/Abp/Modularity/PlugIns/TypePlugInSource.cs` — accepts explicit module types at construction time, useful in tests or when the plugin assembly is already loaded:
 
 ```csharp
-// TypePlugInSource.cs
 public class TypePlugInSource : IPlugInSource
 {
     private readonly Type[] _moduleTypes;
@@ -322,7 +436,8 @@ public class TypePlugInSource : IPlugInSource
 
 ### `IPlugInSource` Contract
 
-Both sources implement `IPlugInSource`:
+All three sources implement `IPlugInSource`
+(`Volo.Abp.Core/Volo/Abp/Modularity/PlugIns/IPlugInSource.cs`):
 
 ```csharp
 public interface IPlugInSource
@@ -331,24 +446,59 @@ public interface IPlugInSource
 }
 ```
 
-`PlugInSourceList` (a `List<IPlugInSource>`) calls each source's `GetModulesWithAllDependencies` (an extension in `PlugInSourceExtensions`) which internally calls `AbpModuleHelper.FindAllModuleTypes` to recursively resolve transitive plugin dependencies.
+The extension method `GetModulesWithAllDependencies` in `PlugInSourceExtensions` calls `AbpModuleHelper.FindAllModuleTypes` on each returned type to recursively resolve transitive plugin dependencies:
+
+```csharp
+// PlugInSourceExtensions.cs
+public static Type[] GetModulesWithAllDependencies(this IPlugInSource plugInSource, ILogger logger)
+{
+    return plugInSource
+        .GetModules()
+        .SelectMany(type => AbpModuleHelper.FindAllModuleTypes(type, logger))
+        .Distinct()
+        .ToArray();
+}
+```
+
+`PlugInSourceList.GetAllModules` calls `GetModulesWithAllDependencies` on every source and deduplicates the result.
 
 <Tip>
-When writing a custom `IPlugInSource`, implement only `GetModules()` and return direct module types. The framework resolves transitive dependencies automatically via `FindAllModuleTypes`.
+When writing a custom `IPlugInSource`, implement only `GetModules()` and return direct module types. The framework resolves transitive dependencies automatically via `GetModulesWithAllDependencies`.
 </Tip>
 
-## Module Discovery Flow Summary
+## Module Discovery Flow
 
 ```mermaid
 flowchart TD
-    START["startupModuleType"] --> FIND["AbpModuleHelper.FindAllModuleTypes()\n(DFS over DependsOn attributes)"]
+    START["startupModuleType"] --> FIND["AbpModuleHelper.FindAllModuleTypes()\n(pre-order DFS over DependsOn graph)"]
     FIND --> FILL["FillModules: CreateModuleDescriptor for each"]
-    PS["PlugInSources"] --> PMOD["GetAllModules(): deduplicated types"]
+    PS["PlugInSourceList"] --> PMOD["GetAllModules(): transitive deps resolved, deduplicated"]
     PMOD --> FILL
     FILL --> SETDEP["SetDependencies: wire IAbpModuleDescriptor.Dependencies"]
-    SETDEP --> SORT["SortByDependencies (topological)"]
-    SORT --> MOVE["MoveItem: startupModule → last"]
+    SETDEP --> SORT["SortByDependencies (topological sort)"]
+    SORT --> MOVE["MoveItem: startupModule → last position"]
     MOVE --> ARR["IAbpModuleDescriptor[]"]
+```
+
+## `ServiceConfigurationContext`
+
+`ServiceConfigurationContext` (`Volo.Abp.Core/Volo/Abp/Modularity/ServiceConfigurationContext.cs`) is the object passed to all three service-configuration phases. It exposes:
+
+| Member | Type | Purpose |
+|---|---|---|
+| `Services` | `IServiceCollection` | The live DI service collection |
+| `Configuration` | `IConfiguration` | Lazily resolved from `Services` |
+| `Items` | `IDictionary<string, object?>` | Arbitrary shared state between modules during configuration |
+| `this[string key]` | `object?` | Indexer shortcut for `Items` |
+
+Modules can use `Items` to pass context or flags to other modules without requiring custom services to already be registered:
+
+```csharp
+// In one module's PreConfigureServices
+context["MyFlag"] = true;
+
+// In another module's ConfigureServices
+if (context["MyFlag"] is true) { ... }
 ```
 
 ## See Also

@@ -41,80 +41,145 @@ sequenceDiagram
     OUT->>DB: DELETE OutboxEvent
 ```
 
+## File Inventory
+
+| File | Role |
+|---|---|
+| `Volo.Abp.EventBus.Abstractions` / `Distributed/IEventOutbox.cs` | Outbox store interface: `EnqueueAsync`, `GetWaitingEventsAsync`, `DeleteAsync`, `DeleteManyAsync` |
+| `Volo.Abp.EventBus.Abstractions` / `Distributed/IEventInbox.cs` | Inbox store interface: `EnqueueAsync`, `GetWaitingEventsAsync`, `MarkAsProcessedAsync`, `RetryLaterAsync`, `MarkAsDiscardAsync`, `ExistsByMessageIdAsync`, `DeleteOldEventsAsync` |
+| `Volo.Abp.EventBus.Abstractions` / `Distributed/OutgoingEventInfo.cs` | Outbox row: `Id`, `EventName`, `EventData` (bytes), `CreationTime`, correlation via `ExtraProperties` |
+| `Volo.Abp.EventBus.Abstractions` / `Distributed/IncomingEventInfo.cs` | Inbox row: `Id`, `MessageId`, `EventName`, `EventData`, `Status`, `RetryCount`, `NextRetryTime`, `HandledTime` |
+| `Volo.Abp.EventBus.Abstractions` / `Distributed/OutboxConfig.cs` | `ImplementationType`, `DatabaseName`, `Selector`, `IsSendingEnabled` |
+| `Volo.Abp.EventBus.Abstractions` / `Distributed/InboxConfig.cs` | `ImplementationType`, `DatabaseName`, `EventSelector`, `HandlerSelector`, `IsProcessingEnabled` |
+| `Volo.Abp.EventBus.Abstractions` / `Distributed/OutboxConfigDictionary.cs` | `Configure(Action<OutboxConfig>)` convenience wrapper around `Dictionary<string, OutboxConfig>` |
+| `Volo.Abp.EventBus.Abstractions` / `Distributed/InboxConfigDictionary.cs` | `Configure(Action<InboxConfig>)` convenience wrapper around `Dictionary<string, InboxConfig>` |
+| `Volo.Abp.EventBus` / `Distributed/OutboxSender.cs` | Background timer worker: acquires distributed lock, drains outbox, publishes to broker |
+| `Volo.Abp.EventBus` / `Distributed/InboxProcessor.cs` | Background timer worker: acquires distributed lock, processes inbox rows per-UoW |
+| `Volo.Abp.EventBus` / `Distributed/OutboxSenderManager.cs` | `IBackgroundWorker` that starts one `OutboxSender` per enabled outbox config |
+| `Volo.Abp.EventBus` / `Distributed/InboxProcessManager.cs` | `IBackgroundWorker` that starts one `InboxProcessor` per enabled inbox config |
+| `Volo.Abp.EventBus` / `Distributed/AbpEventBusBoxesOptions.cs` | Polling interval, batch sizes, failure policy, retry settings, cleanup intervals |
+| `Volo.Abp.EntityFrameworkCore` / `DistributedEvents/EfCoreOutboxConfigExtensions.cs` | `outboxConfig.UseDbContext<TDbContext>()` sets `ImplementationType` and `DatabaseName` |
+| `Volo.Abp.EntityFrameworkCore` / `DistributedEvents/EfCoreInboxConfigExtensions.cs` | `inboxConfig.UseDbContext<TDbContext>()` sets `ImplementationType` and `DatabaseName` |
+
 ## Outbox Configuration
 
-Configure outboxes in your module's `ConfigureServices`:
+Configure outboxes in your module's `ConfigureServices` using the EF Core extension:
 
 ```csharp
 Configure<AbpDistributedEventBusOptions>(options =>
 {
-    options.Outboxes.Configure<MyProjectDbContext>(outbox =>
+    options.Outboxes.Configure(outbox =>
     {
-        outbox.IsSameDatabase = true;
+        // Sets ImplementationType = typeof(IDbContextEventOutbox<MyProjectDbContext>)
+        // and DatabaseName from the DbContext's ConnectionStringName attribute
+        outbox.UseDbContext<MyProjectDbContext>();
+
         // Optionally limit which event types use this outbox:
         outbox.Selector = type => type.Namespace!.StartsWith("MyProject.Orders");
     });
 });
 ```
 
+`OutboxConfigDictionary.Configure(Action<OutboxConfig>)` creates or updates the `"Default"` entry. Named outboxes can be created with the `Configure(string outboxName, Action<OutboxConfig>)` overload, which is useful when routing different event types to different databases.
+
 Inbox configuration is symmetric:
 
 ```csharp
 Configure<AbpDistributedEventBusOptions>(options =>
 {
-    options.Inboxes.Configure<MyProjectDbContext>(inbox =>
+    options.Inboxes.Configure(inbox =>
     {
-        inbox.IsSameDatabase = true;
+        inbox.UseDbContext<MyProjectDbContext>();
+
+        // Only process events matching this selector
         inbox.EventSelector = type => type.Namespace!.StartsWith("MyProject.Orders");
+
+        // Only invoke handlers matching this selector (optional)
+        inbox.HandlerSelector = handlerType => handlerType.Namespace!.StartsWith("MyProject");
     });
 });
 ```
 
-## `IEventOutbox` and `IEventInbox`
-
-Both are generic interfaces resolved from the UoW's `ServiceProvider` or a fresh DI scope. Their concrete implementations are provided by the persistence module (EF Core or MongoDB):
-
-| Interface | EF Core implementation | MongoDB implementation |
-|---|---|---|
-| `IEventOutbox` | `EfCoreEventOutbox<TDbContext>` | `MongoDbContextEventOutbox<TDbContext>` |
-| `IEventInbox` | `EfCoreEventInbox<TDbContext>` | `MongoDbContextEventInbox<TDbContext>` |
-
-Key methods on `IEventOutbox`:
+### `OutboxConfig` and `InboxConfig` properties
 
 ```csharp
-Task EnqueueAsync(OutgoingEventInfo eventInfo);
-Task<List<OutgoingEventInfo>> GetWaitingEventsAsync(
-    int maxCount,
-    Expression<Func<IOutgoingEventInfo, bool>>? filter,
-    CancellationToken cancellationToken);
-Task DeleteAsync(Guid id);
-Task DeleteManyAsync(Guid[] ids);
+public class OutboxConfig
+{
+    public string Name { get; }          // Dictionary key (e.g. "Default")
+    public string DatabaseName { get; set; }  // Used in distributed lock name
+    public Type ImplementationType { get; set; }  // IEventOutbox implementation
+    public Func<Type, bool>? Selector { get; set; }  // Null = match all event types
+    public bool IsSendingEnabled { get; set; } = true; // Disable to pause outbox sending
+}
+
+public class InboxConfig
+{
+    public string Name { get; }
+    public string DatabaseName { get; set; }
+    public Type ImplementationType { get; set; }  // IEventInbox implementation
+    public Func<Type, bool>? EventSelector { get; set; }  // Filter incoming events by type
+    public Func<Type, bool>? HandlerSelector { get; set; } // Filter handlers by type
+    public bool IsProcessingEnabled { get; set; } = true;
+}
 ```
 
-Key methods on `IEventInbox`:
+## `IEventOutbox` and `IEventInbox`
+
+Both are resolved from the UoW's `ServiceProvider` (for outbox writes) or a fresh DI scope (for inbox writes). Their concrete implementations are provided by the persistence module (EF Core or MongoDB).
+
+`IEventOutbox` methods:
 
 ```csharp
-Task EnqueueAsync(IncomingEventInfo eventInfo);
-Task<bool> ExistsByMessageIdAsync(string messageId);
-Task<List<IncomingEventInfo>> GetWaitingEventsAsync(
-    int maxCount,
-    Expression<Func<IIncomingEventInfo, bool>>? filter,
-    CancellationToken cancellationToken);
-Task MarkAsProcessedAsync(Guid id);
-Task MarkAsDiscardAsync(Guid id);
-Task RetryLaterAsync(Guid id, int retryCount, DateTime? nextRetryTime);
-Task DeleteOldEventsAsync();
+public interface IEventOutbox
+{
+    Task EnqueueAsync(OutgoingEventInfo outgoingEvent);
+
+    Task<List<OutgoingEventInfo>> GetWaitingEventsAsync(
+        int maxCount,
+        Expression<Func<IOutgoingEventInfo, bool>>? filter = null,
+        CancellationToken cancellationToken = default);
+
+    Task DeleteAsync(Guid id);
+
+    Task DeleteManyAsync(IEnumerable<Guid> ids);
+}
+```
+
+`IEventInbox` methods:
+
+```csharp
+public interface IEventInbox
+{
+    Task EnqueueAsync(IncomingEventInfo incomingEvent);
+
+    Task<List<IncomingEventInfo>> GetWaitingEventsAsync(
+        int maxCount,
+        Expression<Func<IIncomingEventInfo, bool>>? filter = null,
+        CancellationToken cancellationToken = default);
+
+    Task MarkAsProcessedAsync(Guid id);
+
+    Task RetryLaterAsync(Guid id, int retryCount, DateTime? nextRetryTime);
+
+    Task MarkAsDiscardAsync(Guid id);
+
+    Task<bool> ExistsByMessageIdAsync(string messageId);
+
+    Task DeleteOldEventsAsync();
+}
 ```
 
 ## How Events Enter the Outbox
 
-When `IDistributedEventBus.PublishAsync` is called with `useOutbox: true` and a UoW is active, `DistributedEventBusBase.AddToOutboxAsync` writes an `OutgoingEventInfo` row inside the current UoW's transaction:
+When `IDistributedEventBus.PublishAsync` is called with `useOutbox: true` and a UoW is active, `DistributedEventBusBase.AddToOutboxAsync` writes an `OutgoingEventInfo` row inside the current UoW's transaction. The method iterates all configured outboxes whose `Selector` matches the event type (sorted so specific selectors run before the null/catch-all selector):
 
 ```csharp
 protected virtual async Task<bool> AddToOutboxAsync(Type eventType, object eventData)
 {
     var unitOfWork = UnitOfWorkManager.Current;
     if (unitOfWork == null) return false;
+
+    var addedToOutbox = false;
 
     foreach (var outboxConfig in AbpDistributedEventBusOptions.Outboxes.Values
         .OrderBy(x => x.Selector is null))
@@ -125,6 +190,8 @@ protected virtual async Task<bool> AddToOutboxAsync(Type eventType, object event
                 .GetRequiredService(outboxConfig.ImplementationType);
 
             (var eventName, eventData) = ResolveEventForPublishing(eventType, eventData);
+
+            await OnAddToOutboxAsync(eventName, eventType, eventData);
 
             var outgoingEventInfo = new OutgoingEventInfo(
                 GuidGenerator.Create(),
@@ -138,38 +205,48 @@ protected virtual async Task<bool> AddToOutboxAsync(Type eventType, object event
                 outgoingEventInfo.SetCorrelationId(correlationId);
 
             await eventOutbox.EnqueueAsync(outgoingEventInfo);
-            return true;
+            addedToOutbox = true;
         }
     }
 
-    return false;
+    return addedToOutbox;
 }
 ```
 
 If the UoW rolls back, the `OutgoingEventInfo` row is never committed — the event is silently discarded. If the UoW commits, the row is persisted and will be picked up by `OutboxSender`.
 
-## `OutboxSender` — Background Worker
+## `OutboxSenderManager` and `OutboxSender` — Background Workers
 
-`OutboxSender` is a transient background worker started by `AbpEventBusHostedService` (one instance per configured outbox). It uses `AbpAsyncTimer` to poll on a configurable interval:
+`AbpEventBusModule.OnApplicationInitializationAsync` registers `OutboxSenderManager` as a background worker. At startup it creates one `OutboxSender` per outbox entry whose `IsSendingEnabled` is `true`:
 
 ```csharp
-public class OutboxSender : IOutboxSender, ITransientDependency
+public class OutboxSenderManager : IBackgroundWorker
 {
-    protected AbpAsyncTimer Timer { get; }
-    protected IAbpDistributedLock DistributedLock { get; }
-    protected AbpEventBusBoxesOptions EventBusBoxesOptions { get; }
-    protected string DistributedLockName { get; set; } = default!;
-
-    public virtual Task StartAsync(OutboxConfig outboxConfig, CancellationToken cancellationToken = default)
+    public async Task StartAsync(CancellationToken cancellationToken = default)
     {
-        OutboxConfig = outboxConfig;
-        Outbox = (IEventOutbox)ServiceProvider
-            .GetRequiredService(outboxConfig.ImplementationType);
-        DistributedLockName = $"AbpOutbox_{OutboxConfig.DatabaseName}";
-        Timer.Period = Convert.ToInt32(EventBusBoxesOptions.PeriodTimeSpan.TotalMilliseconds);
-        Timer.Start(cancellationToken);
-        return Task.CompletedTask;
+        foreach (var outboxConfig in Options.Outboxes.Values)
+        {
+            if (outboxConfig.IsSendingEnabled)
+            {
+                var sender = ServiceProvider.GetRequiredService<IOutboxSender>();
+                await sender.StartAsync(outboxConfig, cancellationToken);
+                Senders.Add(sender);
+            }
+        }
     }
+}
+```
+
+`OutboxSender` is an `ITransientDependency` that owns an `AbpAsyncTimer`. On start it sets the distributed lock name from the outbox's `DatabaseName`:
+
+```csharp
+public virtual Task StartAsync(OutboxConfig outboxConfig, CancellationToken cancellationToken = default)
+{
+    OutboxConfig = outboxConfig;
+    Outbox = (IEventOutbox)ServiceProvider.GetRequiredService(outboxConfig.ImplementationType);
+    DistributedLockName = $"AbpOutbox_{OutboxConfig.DatabaseName}";
+    Timer.Start(cancellationToken);
+    return Task.CompletedTask;
 }
 ```
 
@@ -203,18 +280,78 @@ protected virtual async Task RunAsync()
 }
 ```
 
-The distributed lock (`"AbpOutbox_{DatabaseName}"`) ensures that in a multi-instance deployment, only one instance processes the outbox at a time, preventing duplicate broker publishes.
+The distributed lock (`"AbpOutbox_{DatabaseName}"`) ensures that in a multi-instance deployment only one instance processes the outbox at a time, preventing duplicate broker publishes.
 
 ### Batch vs single publishing
 
 | Mode | Behavior |
 |---|---|
-| `BatchPublishOutboxEvents = true` (default) | Calls `PublishManyFromOutboxAsync` + bulk `DeleteManyAsync`. More efficient for high-throughput. |
-| `BatchPublishOutboxEvents = false` | Publishes and deletes one event at a time. More resilient to partial failures. |
+| `BatchPublishOutboxEvents = true` (default) | Calls `PublishManyFromOutboxAsync` + `Outbox.DeleteManyAsync(ids)`. More efficient for high-throughput. |
+| `BatchPublishOutboxEvents = false` | Calls `PublishFromOutboxAsync` + `Outbox.DeleteAsync(id)` per event. More resilient to partial failures. |
 
-## `InboxProcessor` — Background Worker
+## How Events Enter the Inbox
 
-`InboxProcessor` is symmetric to `OutboxSender`. It polls the inbox table, processes each event in an independent transactional UoW, and marks it processed:
+When a broker message arrives, the provider implementation calls `DistributedEventBusBase.AddToInboxAsync`. This method iterates all configured inboxes whose `EventSelector` matches the event type, checks for duplicate `MessageId`, then inserts an `IncomingEventInfo` row:
+
+```csharp
+protected virtual async Task<bool> AddToInboxAsync(
+    string? messageId,
+    string eventName,
+    Type eventType,
+    object eventData,
+    string? correlationId)
+{
+    if (AbpDistributedEventBusOptions.Inboxes.Count <= 0) return false;
+
+    var addToInbox = false;
+
+    using (var scope = ServiceScopeFactory.CreateScope())
+    {
+        foreach (var inboxConfig in AbpDistributedEventBusOptions.Inboxes.Values
+            .OrderBy(x => x.EventSelector is null))
+        {
+            if (inboxConfig.EventSelector == null || inboxConfig.EventSelector(eventType))
+            {
+                var eventInbox = (IEventInbox)scope.ServiceProvider
+                    .GetRequiredService(inboxConfig.ImplementationType);
+
+                if (!messageId.IsNullOrEmpty())
+                {
+                    if (await eventInbox.ExistsByMessageIdAsync(messageId!))
+                    {
+                        // Already seen this message — skip insert but still flag as handled
+                        addToInbox = true;
+                        continue;
+                    }
+                }
+
+                eventData = GetEventData(eventData);
+
+                var incomingEventInfo = new IncomingEventInfo(
+                    GuidGenerator.Create(),
+                    messageId!,
+                    eventName,
+                    Serialize(eventData),
+                    Clock.Now
+                );
+                incomingEventInfo.SetCorrelationId(correlationId!);
+                await eventInbox.EnqueueAsync(incomingEventInfo);
+                addToInbox = true;
+            }
+        }
+    }
+
+    return addToInbox;
+}
+```
+
+The `ExistsByMessageIdAsync` check provides **idempotency** at the inbox level: if the broker redelivers a message (e.g., after a network partition), the inbox ignores the duplicate.
+
+## `InboxProcessManager` and `InboxProcessor` — Background Workers
+
+`AbpEventBusModule` also registers `InboxProcessManager` as a background worker. It creates one `InboxProcessor` per inbox entry whose `IsProcessingEnabled` is `true`.
+
+`InboxProcessor.RunAsync` first calls `DeleteOldEventsAsync` (subject to `CleanOldEventTimeIntervalSpan` throttle), then processes each waiting event in its own transactional UoW:
 
 ```csharp
 protected virtual async Task RunAsync()
@@ -233,66 +370,35 @@ protected virtual async Task RunAsync()
 
                 foreach (var waitingEvent in waitingEvents)
                 {
-                    using (var uow = UnitOfWorkManager.Begin(
-                        isTransactional: true, requiresNew: true))
+                    try
                     {
-                        await DistributedEventBus
-                            .AsSupportsEventBoxes()
-                            .ProcessFromInboxAsync(waitingEvent, InboxConfig);
+                        using (var uow = UnitOfWorkManager.Begin(
+                            isTransactional: true, requiresNew: true))
+                        {
+                            await DistributedEventBus
+                                .AsSupportsEventBoxes()
+                                .ProcessFromInboxAsync(waitingEvent, InboxConfig);
 
-                        await Inbox.MarkAsProcessedAsync(waitingEvent.Id);
-                        await uow.CompleteAsync(StoppingToken);
+                            await Inbox.MarkAsProcessedAsync(waitingEvent.Id);
+                            await uow.CompleteAsync(StoppingToken);
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        // Handle according to InboxProcessorFailurePolicy (see below)
                     }
                 }
             }
         }
-    }
-}
-```
-
-Each event is processed in its own `requiresNew: true` UoW, so a handler failure does not roll back previously processed events.
-
-### How events enter the Inbox
-
-When a broker message arrives, the provider implementation calls `DistributedEventBusBase.AddToInboxAsync`:
-
-```csharp
-protected virtual async Task<bool> AddToInboxAsync(
-    string? messageId,
-    string eventName,
-    Type eventType,
-    object eventData,
-    string? correlationId)
-{
-    foreach (var inboxConfig in AbpDistributedEventBusOptions.Inboxes.Values
-        .OrderBy(x => x.EventSelector is null))
-    {
-        if (inboxConfig.EventSelector == null || inboxConfig.EventSelector(eventType))
+        else
         {
-            var eventInbox = (IEventInbox)scope.ServiceProvider
-                .GetRequiredService(inboxConfig.ImplementationType);
-
-            // Deduplication: skip if already seen this messageId
-            if (!messageId.IsNullOrEmpty() &&
-                await eventInbox.ExistsByMessageIdAsync(messageId!))
-                continue;
-
-            var incomingEventInfo = new IncomingEventInfo(
-                GuidGenerator.Create(),
-                messageId!,
-                eventName,
-                Serialize(eventData),
-                Clock.Now
-            );
-            incomingEventInfo.SetCorrelationId(correlationId!);
-            await eventInbox.EnqueueAsync(incomingEventInfo);
+            await Task.Delay(EventBusBoxesOptions.DistributedLockWaitDuration, StoppingToken);
         }
     }
-    return true;
 }
 ```
 
-The `ExistsByMessageIdAsync` check provides **idempotency** at the inbox level: if the broker redelivers a message (e.g., after a network partition), the inbox ignores the duplicate.
+Each event is processed in its own `requiresNew: true` UoW, so a handler failure does not roll back previously processed events. `InboxConfig.HandlerSelector` is passed to `ProcessFromInboxAsync`, allowing selective handler invocation per inbox configuration.
 
 ## Failure Policies for Inbox Processing
 
@@ -301,9 +407,9 @@ The `ExistsByMessageIdAsync` check provides **idempotency** at the inbox level: 
 ```csharp
 public enum InboxProcessorFailurePolicy
 {
-    Retry,       // Re-throw; timer will retry on next tick
-    RetryLater,  // Exponential back-off; max retries before discard
-    Discard      // Mark as discarded immediately
+    Retry,      // Re-throw; timer will retry the same event on next tick (default)
+    RetryLater, // Exponential back-off; discard after max retries
+    Discard     // Mark as discarded immediately on first failure
 }
 ```
 
@@ -317,11 +423,15 @@ protected virtual DateTime? GetNextRetryTime(int retryCount, double factor)
 }
 ```
 
-With default `InboxProcessorRetryBackoffFactor = 10`:
-- Retry 0 → 10 s
-- Retry 1 → 20 s
-- Retry 2 → 40 s
-- Retry 9 → 5120 s (~85 min)
+With the default `InboxProcessorRetryBackoffFactor = 10`:
+
+| Retry count | Delay |
+|---|---|
+| 0 | 10 s |
+| 1 | 20 s |
+| 2 | 40 s |
+| 3 | 80 s |
+| 9 | 5120 s (~85 min) |
 
 After `InboxProcessorMaxRetryCount` (default: 10) exhausted retries, the event is marked `Discarded`:
 
@@ -354,9 +464,9 @@ public class AbpEventBusBoxesOptions
     // Distributed lock back-off when lock unavailable (default: 15 seconds)
     public TimeSpan DistributedLockWaitDuration { get; set; }
 
-    // Inbox failure handling
+    // Inbox failure handling (default: Retry)
     public InboxProcessorFailurePolicy InboxProcessorFailurePolicy { get; set; }
-    public int InboxProcessorMaxRetryCount { get; set; }     // default: 10
+    public int InboxProcessorMaxRetryCount { get; set; }        // default: 10
     public double InboxProcessorRetryBackoffFactor { get; set; } // default: 10
 
     // How often old processed inbox events are cleaned up (default: 6 hours)
@@ -393,7 +503,8 @@ sequenceDiagram
     OS->>OS: release lock
 
     BRK->>IP: Message received (consumer callback)
-    IP->>DB: INSERT InboxEvent (dedup check first)
+    IP->>DB: ExistsByMessageId? (dedup check)
+    IP->>DB: INSERT InboxEvent
     IP->>IP: acquire DistributedLock "AbpInbox_*"
     IP->>DB: SELECT top 1000 waiting InboxEvents
     IP->>IP: BEGIN UoW (isTransactional=true, requiresNew=true)
@@ -405,7 +516,7 @@ sequenceDiagram
 ```
 
 <Warning>
-The Outbox/Inbox pattern requires that your `DbContext` has `OutboxEvents` and `InboxEvents` tables. When using EF Core, add `modelBuilder.ConfigureEventOutbox()` and `modelBuilder.ConfigureEventInbox()` in `OnModelCreating`, then create the corresponding migrations. For MongoDB, call the equivalent model builder extension methods.
+The Outbox/Inbox pattern requires that your `DbContext` implements `IHasEventOutbox` / `IHasEventInbox` and has the corresponding tables. When using EF Core, call `outbox.UseDbContext<TDbContext>()` (from `Volo.Abp.EntityFrameworkCore`) in your outbox/inbox configuration, then create and apply the EF Core migrations for the new tables. For MongoDB, call the equivalent model builder extension methods from the MongoDB integration package.
 </Warning>
 
 <Note>

@@ -33,13 +33,22 @@ public abstract class ApplicationService :
 {
     public IAbpLazyServiceProvider LazyServiceProvider { get; set; } = default!;
 
+    [Obsolete("Use LazyServiceProvider instead.")]
+    public IServiceProvider ServiceProvider { get; set; } = default!;
+
     public static string[] CommonPostfixes { get; set; } =
         { "AppService", "ApplicationService", "Service" };
+
+    public List<string> AppliedCrossCuttingConcerns { get; } = new();
     // ...
 }
 ```
 
 Implementing `ITransientDependency` ensures automatic DI registration at transient lifetime. The marker interfaces (`IUnitOfWorkEnabled`, `IAuditingEnabled`, etc.) activate the corresponding AOP interceptors without any attribute decoration.
+
+<Note>
+The `ServiceProvider` property is marked `[Obsolete]`. Always use `LazyServiceProvider` or the typed computed properties instead.
+</Note>
 
 ### Key lazy-resolved properties
 
@@ -58,7 +67,9 @@ All services are resolved through `IAbpLazyServiceProvider` — cached on first 
 | `Clock` | `IClock` | Time abstraction |
 | `DataFilter` | `IDataFilter` | Enable / disable data filters programmatically |
 | `L` | `IStringLocalizer` | Localized string lookup |
+| `StringLocalizerFactory` | `IStringLocalizerFactory` | Factory for creating localizers with custom resources |
 | `Logger` | `ILogger` | Scoped to the concrete class name |
+| `AsyncExecuter` | `IAsyncQueryableExecuter` | Provider-agnostic async LINQ execution |
 
 ### The `L` localizer
 
@@ -139,47 +150,62 @@ classDiagram
     class EntityDto_TKey {
         +Id: TKey
     }
-    class CreationAuditedEntityDto {
+    class CreationAuditedEntityDto_TKey {
         +CreationTime: DateTime
         +CreatorId: Guid?
     }
-    class AuditedEntityDto {
+    class AuditedEntityDto_TKey {
         +LastModificationTime: DateTime?
         +LastModifierId: Guid?
     }
-    class FullAuditedEntityDto {
+    class FullAuditedEntityDto_TKey {
         +IsDeleted: bool
         +DeleterId: Guid?
         +DeletionTime: DateTime?
     }
-    class ExtensibleEntityDto {
+    class ExtensibleEntityDto_TKey {
         +ExtraProperties: ExtraPropertyDictionary
     }
 
     IEntityDto_TKey <|.. EntityDto_TKey
-    EntityDto_TKey <|-- CreationAuditedEntityDto
-    CreationAuditedEntityDto <|-- AuditedEntityDto
-    AuditedEntityDto <|-- FullAuditedEntityDto
-    EntityDto_TKey <|-- ExtensibleEntityDto
+    EntityDto_TKey <|-- CreationAuditedEntityDto_TKey
+    CreationAuditedEntityDto_TKey <|-- AuditedEntityDto_TKey
+    AuditedEntityDto_TKey <|-- FullAuditedEntityDto_TKey
+    IEntityDto_TKey <|.. ExtensibleEntityDto_TKey
 ```
 
-`Extensible*` variants (e.g., `ExtensibleAuditedEntityDto<TKey>`) add `ExtraProperties: ExtraPropertyDictionary` — use them for entities backed by `AggregateRoot<TKey>` so the extra properties round-trip through the API.
+Each class also has a non-generic counterpart (without `TKey`) for situations where no ID is needed in the DTO. The full set of concrete classes:
+
+| Class | Adds |
+|---|---|
+| `EntityDto<TKey>` | `Id` |
+| `CreationAuditedEntityDto<TKey>` | `+ CreationTime`, `CreatorId` |
+| `AuditedEntityDto<TKey>` | `+ LastModificationTime`, `LastModifierId` |
+| `FullAuditedEntityDto<TKey>` | `+ IsDeleted`, `DeleterId`, `DeletionTime` |
+| `ExtensibleEntityDto<TKey>` | `Id` + `ExtraProperties` (extends `ExtensibleObject`) |
+| `ExtensibleCreationAuditedEntityDto<TKey>` | Extensible + creation audit |
+| `ExtensibleAuditedEntityDto<TKey>` | Extensible + full audit (no soft-delete) |
+| `ExtensibleFullAuditedEntityDto<TKey>` | Extensible + full audit + soft-delete |
+
+`Extensible*` variants extend `ExtensibleObject` (which carries `ExtraProperties: ExtraPropertyDictionary`) — use them for entities backed by `AggregateRoot<TKey>` so the extra properties round-trip through the API.
 
 Pagination input DTOs follow a parallel hierarchy:
 
 ```csharp
-// Minimal — just MaxResultCount
-LimitedResultRequestDto
+// Minimal — just MaxResultCount (default 10, max 1000)
+LimitedResultRequestDto : ILimitedResultRequest, IValidatableObject
 
 // Adds SkipCount
-PagedResultRequestDto : LimitedResultRequestDto
+PagedResultRequestDto : LimitedResultRequestDto, IPagedResultRequest
 
 // Adds Sorting
-PagedAndSortedResultRequestDto : PagedResultRequestDto
+PagedAndSortedResultRequestDto : PagedResultRequestDto, IPagedAndSortedResultRequest
 
 // Output container
 PagedResultDto<T>(long TotalCount, IReadOnlyList<T> Items)
 ```
+
+`LimitedResultRequestDto` validates that `MaxResultCount` does not exceed `MaxMaxResultCount` (static, defaults to 1,000). `Extensible*` variants of each pagination DTO also exist for use when extra properties must pass through.
 
 ## `CrudAppService<TEntity,TEntityDto,TKey>` — the full generic chain
 
@@ -239,6 +265,7 @@ public abstract class AbstractKeyCrudAppService<TEntity, TGetOutputDto, TGetList
     TKey, TGetListInput, TCreateInput, TUpdateInput>
     : AbstractKeyReadOnlyAppService<...>,
       ICrudAppService<TGetOutputDto, TGetListOutputDto, TKey, TGetListInput, TCreateInput, TUpdateInput>
+    where TEntity : class, IEntity
 {
     protected IRepository<TEntity> Repository { get; }
 
@@ -272,6 +299,10 @@ public abstract class AbstractKeyCrudAppService<TEntity, TGetOutputDto, TGetList
 }
 ```
 
+Note that `AbstractKeyCrudAppService` uses `IRepository<TEntity>` (the non-keyed variant) — the keyed `IRepository<TEntity, TKey>` is only used by `CrudAppService` itself (its override of `DeleteByIdAsync` calls `Repository.DeleteAsync(id)`).
+
+`MapToEntity(TCreateInput)` uses `ObjectMapper` by default, but also calls `SetIdForGuids` which sets a new `GuidGenerator.Create()` ID if the entity has a `Guid` key and the ID is empty.
+
 ### What `AbstractKeyReadOnlyAppService` provides
 
 ```csharp
@@ -283,21 +314,26 @@ public virtual async Task<PagedResultDto<TGetListOutputDto>> GetListAsync(TGetLi
     var totalCount = await AsyncExecuter.CountAsync(query);
 
     var entities = new List<TEntity>();
+    var entityDtos = new List<TGetListOutputDto>();
+
     if (totalCount > 0)
     {
         query = ApplySorting(query, input);
         query = ApplyPaging(query, input);
         entities = await AsyncExecuter.ToListAsync(query);
+        entityDtos = await MapToGetListOutputDtosAsync(entities);
     }
 
     return new PagedResultDto<TGetListOutputDto>(
         totalCount,
-        await MapToGetListOutputDtosAsync(entities)
+        entityDtos
     );
 }
 ```
 
 Override `CreateFilteredQueryAsync` to add search predicates; `ApplySorting` and `ApplyPaging` handle the rest automatically when the input implements `ISortedResultRequest` / `IPagedResultRequest`.
+
+The base `AbstractKeyReadOnlyAppService.ApplyDefaultSorting` throws `AbpException` if the entity does not implement `IHasCreationTime` — it requires subclasses to provide a fallback. Both `CrudAppService` and `ReadOnlyAppService` override this with a safe fallback.
 
 ### Default sorting in `CrudAppService`
 
@@ -357,7 +393,8 @@ public abstract class ReadOnlyAppService<TEntity, TGetOutputDto, TGetListOutputD
 {
     protected IReadOnlyRepository<TEntity, TKey> Repository { get; }
 
-    protected ReadOnlyAppService(IReadOnlyRepository<TEntity, TKey> repository) : base(repository)
+    protected ReadOnlyAppService(IReadOnlyRepository<TEntity, TKey> repository)
+        : base(repository)
     {
         Repository = repository;
     }
@@ -378,7 +415,9 @@ public abstract class ReadOnlyAppService<TEntity, TGetOutputDto, TGetListOutputD
 }
 ```
 
-It accepts `IReadOnlyRepository<TEntity, TKey>` instead of `IRepository`, so it can be used safely in read-replica scenarios.
+It accepts `IReadOnlyRepository<TEntity, TKey>` instead of `IRepository`, so it can be used safely in read-replica scenarios. Note that `ReadOnlyAppService` checks `ICreationAuditedObject` (the auditing marker interface), whereas `CrudAppService` checks `IHasCreationTime` (the more general interface) — the practical result is the same for most entities.
+
+Short overloads exist: `ReadOnlyAppService<TEntity, TEntityDto, TKey>` (3 type params, defaults `TGetListInput = PagedAndSortedResultRequestDto`) and `ReadOnlyAppService<TEntity, TEntityDto, TKey, TGetListInput>` (4 type params, defaults get/list output DTOs to `TEntityDto`).
 
 ## A complete example
 
@@ -477,8 +516,8 @@ For full details on verb mapping rules, route grouping, and how to override conv
             PagedAndSortedResultRequestDto input)
         {
             return (await base.CreateFilteredQueryAsync(input))
-                .WhereIf(!input.Filter.IsNullOrWhiteSpace(),
-                    o => o.Reference.Contains(input.Filter));
+                .WhereIf(!input.Sorting.IsNullOrWhiteSpace(),
+                    o => o.Reference.Contains(input.Sorting));
         }
     }
     ```

@@ -109,6 +109,8 @@ public interface ITenantRepository : IBasicRepository<Tenant, Guid>
 
 `FindByNameAsync` is the hot path for the multi-tenancy resolver — it accepts a pre-normalized name (upper-cased) to use index-friendly comparisons. `includeDetails = true` causes the EF Core query to eager-load `ConnectionStrings`.
 
+The interface also contains two `[Obsolete]` synchronous methods (`FindByName` and `FindById`) retained for backwards compatibility — prefer the async overloads in new code.
+
 ## Domain Service: TenantManager
 
 ```csharp

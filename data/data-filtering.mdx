@@ -19,13 +19,15 @@ ABP's data filtering system provides a centralized, scoped way to enable or disa
     Options class (`Dictionary<Type, DataFilterState>`) for setting the default enabled/disabled state of each filter at application startup.
   </Card>
   <Card title="DataFilterState" icon="circle-dot">
-    A simple mutable struct holding `bool IsEnabled`. Cloned from `AbpDataFilterOptions.DefaultStates` on first access per async context.
+    A simple mutable class holding `bool IsEnabled`. Cloned from `AbpDataFilterOptions.DefaultStates` on first access per async context.
   </Card>
 </CardGroup>
 
 ## Implementation
 
 ### `DataFilter` (singleton)
+
+Defined in `Volo.Abp.Data/Volo/Abp/Data/DataFilter.cs`:
 
 ```csharp
 public class DataFilter : IDataFilter, ISingletonDependency
@@ -46,13 +48,13 @@ public class DataFilter : IDataFilter, ISingletonDependency
     {
         return (_filters.GetOrAdd(
             typeof(TFilter),
-            _ => _serviceProvider.GetRequiredService<IDataFilter<TFilter>>()
+            factory: () => _serviceProvider.GetRequiredService<IDataFilter<TFilter>>()
         ) as IDataFilter<TFilter>)!;
     }
 }
 ```
 
-`GetOrAdd` ensures a single `IDataFilter<TFilter>` instance per type is cached in the dictionary. The per-type instance is resolved from DI (transient, but effectively cached here), which means it participates in the normal DI lifetime.
+`GetOrAdd` ensures a single `IDataFilter<TFilter>` instance per type is cached in the dictionary. The per-type instance is resolved from DI on first access and then reused for the lifetime of the singleton.
 
 ### `DataFilter<TFilter>` (per-type, singleton-cached)
 
@@ -60,9 +62,6 @@ public class DataFilter : IDataFilter, ISingletonDependency
 public class DataFilter<TFilter> : IDataFilter<TFilter>
     where TFilter : class
 {
-    private readonly AbpDataFilterOptions _options;
-    private readonly AsyncLocal<DataFilterState> _filter;
-
     public bool IsEnabled
     {
         get
@@ -70,6 +69,15 @@ public class DataFilter<TFilter> : IDataFilter<TFilter>
             EnsureInitialized();
             return _filter.Value!.IsEnabled;
         }
+    }
+
+    private readonly AbpDataFilterOptions _options;
+    private readonly AsyncLocal<DataFilterState> _filter;
+
+    public DataFilter(IOptions<AbpDataFilterOptions> options)
+    {
+        _options = options.Value;
+        _filter = new AsyncLocal<DataFilterState>();
     }
 
     public IDisposable Enable()
@@ -98,7 +106,7 @@ public class DataFilter<TFilter> : IDataFilter<TFilter>
 Key design points:
 - `AsyncLocal<DataFilterState>` gives each async execution context its own copy of the filter state. A background job disabling soft-delete does not affect the web request running concurrently.
 - `EnsureInitialized` lazily copies the default state from `AbpDataFilterOptions.DefaultStates` on first access. If no default is registered, the filter starts **enabled**.
-- `Enable()` and `Disable()` return `IDisposable` that restores the previous state on disposal — use them with `using` blocks.
+- `Enable()` and `Disable()` toggle `_filter.Value!.IsEnabled` directly and return a `DisposeAction` that calls the opposite method when disposed. This means the `using` pattern acts as a toggle — `using (Disable())` sets `IsEnabled = false` and restores it to `true` on disposal. Consequently, **nesting** `Disable()` calls inside an already-disabled context is safe (the inner call returns `NullDisposable`), but nesting `Enable()` inside `Disable()` will restore to disabled on inner disposal, then to enabled on outer disposal.
 
 ## Built-in Filters
 
@@ -128,7 +136,7 @@ When enabled (default), queries automatically restrict results to the current te
 
 ## How EF Core Applies Filters
 
-During `OnModelCreating`, `AbpDbContext` calls `CreateFilterExpression<TEntity>` for every entity type that implements `ISoftDelete` or `IMultiTenant`, then registers the expression as an EF Core global query filter:
+During `OnModelCreating`, `AbpDbContext` calls `CreateFilterExpression<TEntity>` for every entity type that implements `ISoftDelete` or `IMultiTenant`, then registers the expression as an EF Core global query filter via `HasQueryFilter`:
 
 ```csharp
 // Soft-delete filter expression (standard path)
@@ -149,7 +157,7 @@ entityTypeBuilder.HasQueryFilter(combinedExpression);
 
 ### DB-function path
 
-When `AbpEfCoreGlobalFilterOptions.UseDbFunction` is enabled, the filter expression is replaced with a call to a mapped SQL scalar function:
+When `AbpEfCoreGlobalFilterOptions.UseDbFunction` is enabled (and the provider is relational with `AbpDbContextOptionsExtension`), the filter expression is replaced with a call to a mapped SQL scalar function:
 
 ```csharp
 expression = e => AbpEfCoreDataFilterDbFunctionMethods.SoftDeleteFilter(
@@ -223,7 +231,21 @@ Configure<AbpDataFilterOptions>(options =>
 });
 ```
 
-The `DefaultStates` dictionary is cloned per `AsyncLocal` context on first access, so changing defaults at startup does not affect already-initialized async contexts.
+The `DefaultStates` dictionary is defined in `AbpDataFilterOptions` (`Volo.Abp.Data/Volo/Abp/Data/AbpDataFilterOptions.cs`):
+
+```csharp
+public class AbpDataFilterOptions
+{
+    public Dictionary<Type, DataFilterState> DefaultStates { get; }
+
+    public AbpDataFilterOptions()
+    {
+        DefaultStates = new Dictionary<Type, DataFilterState>();
+    }
+}
+```
+
+Values in `DefaultStates` are cloned per `AsyncLocal` context on first access, so changing defaults at startup does not affect already-initialized async contexts.
 
 ## Defining Custom Filters
 
@@ -256,7 +278,7 @@ The `DefaultStates` dictionary is cloned per `AsyncLocal` context on first acces
         if (typeof(IIsActive).IsAssignableFrom(typeof(TEntity)))
         {
             Expression<Func<TEntity, bool>> isActiveFilter =
-                e => !IsEnabled<IIsActive>() || ((IIsActive)e).IsActive;
+                e => !IsDataFilterEnabled<IIsActive>() || ((IIsActive)e).IsActive;
 
             expression = expression == null
                 ? isActiveFilter
@@ -266,7 +288,7 @@ The `DefaultStates` dictionary is cloned per `AsyncLocal` context on first acces
         return expression;
     }
 
-    protected bool IsEnabled<TFilter>() where TFilter : class
+    protected virtual bool IsDataFilterEnabled<TFilter>() where TFilter : class
         => DataFilter?.IsEnabled<TFilter>() ?? false;
     ```
   </Step>

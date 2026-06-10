@@ -23,7 +23,25 @@ ABP's MongoDB integration mirrors the architecture of the EF Core layer but oper
   </Card>
 </CardGroup>
 
+## `IAbpMongoDbContext` Interface
+
+Defined in `Volo.Abp.MongoDB/Volo/Abp/MongoDB/IAbpMongoDbContext.cs`:
+
+```csharp
+public interface IAbpMongoDbContext
+{
+    IMongoClient Client { get; }
+    IMongoDatabase Database { get; }
+    IMongoCollection<T> Collection<T>();
+    IClientSessionHandle? SessionHandle { get; }
+}
+```
+
+This interface is deliberately minimal — it contains only the four members that repositories need. The full `AbpMongoDbContext` base class has additional infrastructure members such as `LazyServiceProvider`, `ModelSource`, `InitializeDatabase`, and `InitializeCollections`.
+
 ## `AbpMongoDbContext`
+
+Defined in `Volo.Abp.MongoDB/Volo/Abp/MongoDB/AbpMongoDbContext.cs`:
 
 ```csharp
 public abstract class AbpMongoDbContext : IAbpMongoDbContext, ITransientDependency
@@ -45,6 +63,12 @@ public abstract class AbpMongoDbContext : IAbpMongoDbContext, ITransientDependen
         SessionHandle = sessionHandle;
     }
 
+    public virtual void InitializeCollections(IMongoDatabase database)
+    {
+        Database = database;
+        ModelSource.GetModel(this);
+    }
+
     public virtual IMongoCollection<T> Collection<T>()
     {
         return Database.GetCollection<T>(GetCollectionName<T>());
@@ -54,8 +78,22 @@ public abstract class AbpMongoDbContext : IAbpMongoDbContext, ITransientDependen
     {
         return GetEntityModel<T>().CollectionName;
     }
+
+    protected virtual IMongoEntityModel GetEntityModel<TEntity>()
+    {
+        var model = ModelSource.GetModel(this).Entities.GetOrDefault(typeof(TEntity));
+        if (model == null)
+        {
+            throw new AbpException(
+                "Could not find a model for given entity type: "
+                + typeof(TEntity).AssemblyQualifiedName);
+        }
+        return model;
+    }
 }
 ```
+
+`InitializeDatabase` is called by `UnitOfWorkMongoDbContextProvider` when creating the context for a new UoW scope. `InitializeCollections` is used in scenarios where only the database handle is needed without starting a full UoW (e.g., background index-creation workers).
 
 ### Collection configuration via `CreateModel`
 
@@ -151,13 +189,21 @@ public class AbpGuidCustomBsonTypeMapper : ICustomBsonTypeMapper
 
 ### `AbpMongoDbDateTimeSerializer`
 
-Controls the `DateTimeKind` of deserialized `DateTime` values and optionally disables normalization (UTC conversion):
+Defined in `Volo.Abp.MongoDB/Volo/Abp/MongoDB/AbpMongoDbDateTimeSerializer.cs`. Controls the `DateTimeKind` of deserialized `DateTime` values and optionally disables normalization (UTC conversion). It is registered per-property by `MongoModelBuilder` when building the BSON class map:
 
 ```csharp
 public class AbpMongoDbDateTimeSerializer : StructSerializerBase<DateTime>
 {
     protected DateTimeKind DateTimeKind { get; set; }
     protected bool DisableDateTimeNormalization { get; set; }
+
+    public AbpMongoDbDateTimeSerializer(
+        DateTimeKind dateTimeKind,
+        bool disableDateTimeNormalization)
+    {
+        DateTimeKind = dateTimeKind;
+        DisableDateTimeNormalization = disableDateTimeNormalization;
+    }
 
     public override void Serialize(
         BsonSerializationContext context,
@@ -229,7 +275,7 @@ var cursor = await collection.FindAsync(combinedFilter, ...);
 ```
 
 <Warning>
-Because MongoDB filtering is applied in-process (by the driver, not the server-side query planner with indexed filters), disabling `ISoftDelete` via `IDataFilter.Disable<ISoftDelete>()` is cheap — the filterer simply skips adding that `FilterDefinition`. However, ensure your MongoDB indexes cover both filtered and unfiltered query patterns when you need to query deleted records.
+Because MongoDB filtering is applied by the driver (not as a server-side indexed query plan), disabling `ISoftDelete` via `IDataFilter.Disable<ISoftDelete>()` is cheap — the filterer simply skips adding that `FilterDefinition`. However, ensure your MongoDB indexes cover both filtered and unfiltered query patterns when you need to query deleted records.
 </Warning>
 
 ## Repository Differences vs EF Core
@@ -247,7 +293,7 @@ Because MongoDB filtering is applied in-process (by the driver, not the server-s
 
 ## Module Registration
 
-`AbpMongoDbModule` registers all infrastructure types. The relevant `ConfigureServices` entries:
+`AbpMongoDbModule` (`Volo.Abp.MongoDB/Volo/Abp/MongoDB/AbpMongoDbModule.cs`) registers all infrastructure types. The relevant `ConfigureServices` entries:
 
 ```csharp
 // Default IMongoDbContextProvider<> implementation
@@ -255,7 +301,7 @@ context.Services.TryAddTransient(
     typeof(IMongoDbContextProvider<>),
     typeof(UnitOfWorkMongoDbContextProvider<>));
 
-// Default repository filterers
+// Default repository filterers (single-key and composite-key variants)
 context.Services.TryAddEnumerable(ServiceDescriptor.Transient(
     typeof(IMongoDbRepositoryFilterer<>),
     typeof(MongoDbRepositoryFilterer<>)));
@@ -273,4 +319,4 @@ context.Services.AddTransient(
     typeof(MongoDbContextEventInbox<>));
 ```
 
-The `AbpMongoDbConventionalRegistrar` scans assemblies during module startup and auto-registers `AbpMongoDbContext` subclasses and their repositories following the same conventions as the EF Core registrar.
+The `AbpMongoDbConventionalRegistrar` (registered in `PreConfigureServices`) scans assemblies during module startup and auto-registers `AbpMongoDbContext` subclasses and their repositories following the same conventions as the EF Core registrar.

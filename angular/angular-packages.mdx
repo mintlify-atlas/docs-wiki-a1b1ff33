@@ -99,8 +99,8 @@ export class CoreModule {
 
 ```mermaid
 graph TD
-    CM[CoreModule] --> RCM[RootCoreModule]
-    RCM --> BCM[BaseCoreModule]
+    CM[CoreModule] -->|imports + exports| BCM[BaseCoreModule]
+    RCM[RootCoreModule] -->|imports + exports| BCM
     BCM --> CommonModule
     BCM --> FormsModule
     BCM --> ReactiveFormsModule
@@ -110,11 +110,12 @@ graph TD
     BCM --> Pipes["10 ABP Pipes"]
     BCM --> Components["4 ABP Components"]
     RCM --> XsrfConfig["XSRF Config\ncookieName: XSRF-TOKEN\nheaderName: RequestVerificationToken"]
+    CM -.->|forRoot returns ngModule| RCM
 ```
 
-**`BaseCoreModule`** holds all imports, declarations, and exports. It is the module imported by all feature modules that need ABP functionality without re-running root-level providers.
+**`BaseCoreModule`** holds all imports, declarations, and exports. It is the module imported and re-exported by all other CoreModule variants, giving feature modules access to ABP directives, pipes, and components without re-registering root-level providers.
 
-**`RootCoreModule`** extends `BaseCoreModule` and adds XSRF configuration:
+**`RootCoreModule`** imports and exports `BaseCoreModule`, and additionally provides XSRF configuration:
 
 ```typescript
 @NgModule({
@@ -131,6 +132,8 @@ graph TD
 })
 export class RootCoreModule {}
 ```
+
+`CoreModule.forRoot()` returns `{ ngModule: RootCoreModule, ... }`, so `RootCoreModule` — not `CoreModule` itself — is the actual module bootstrapped at the application root. `CoreModule` exists solely as the public API class with the deprecated `forRoot`/`forChild` static methods.
 
 **`CoreModule`** is the public API for consumers. New Angular applications should use the standalone provider functions instead.
 
@@ -195,33 +198,40 @@ export const appConfig: ApplicationConfig = {
 
 ## Public API Surface
 
-`@abp/ng.core`'s `public-api.ts` exports these categories:
+`@abp/ng.core`'s `public-api.ts` exports these categories (shown verbatim from source):
 
 ```typescript
-export * from './lib/abstracts';          // Base classes for services and components
-export * from './lib/components';          // DynamicLayout, RouterOutlet, etc.
-export * from './lib/constants';           // Token names, route constants
-export * from './lib/core.module';         // CoreModule, BaseCoreModule, RootCoreModule
-export * from './lib/directives';          // All directives
-export * from './lib/enums';               // ABP enums
-export * from './lib/guards';              // Route guards
-export * from './lib/localization.module'; // LocalizationModule (lazy)
-export * from './lib/models';             // ABP.Root, ABP.Child, etc.
-export * from './lib/pipes';              // All pipes
-export * from './lib/providers';           // provideAbpCore, provideAbpCoreChild, withOptions
-export * from './lib/services';           // ConfigStateService, AuthService, etc.
-export * from './lib/strategies';         // Auth strategies
-export * from './lib/tokens';             // Injection tokens
-export * from './lib/utils';              // Utility functions
-export * from './lib/validators';          // Custom form validators
-export * from './lib/interceptors';        // HTTP interceptors
-export * from './lib/clients';            // ApplicationConfigurationClient, etc.
+// export * from './lib/handlers';  // intentionally commented out in source
+export * from './lib/abstracts';
+export * from './lib/components';
+export * from './lib/constants';
+export * from './lib/core.module';
+export * from './lib/directives';
+export * from './lib/enums';
+export * from './lib/guards';
+export * from './lib/localization.module';
+export * from './lib/models';
+export * from './lib/pipes';
+export * from './lib/providers';
 
-// Generated proxy types
+// Generated proxy types (bundled into the core package)
+export * from './lib/proxy/pages/abp/multi-tenancy';
+export * from './lib/proxy/volo/abp/asp-net-core/mvc/api-exploring';
 export * from './lib/proxy/volo/abp/asp-net-core/mvc/application-configurations';
+export * from './lib/proxy/volo/abp/asp-net-core/mvc/application-configurations/object-extending';
+export * from './lib/proxy/volo/abp/asp-net-core/mvc/multi-tenancy';
+export * from './lib/proxy/volo/abp/multi-tenancy';
 export * from './lib/proxy/volo/abp/http/modeling';
 export * from './lib/proxy/volo/abp/localization';
-// ...
+export * from './lib/proxy/volo/abp/models';
+
+export * from './lib/services';
+export * from './lib/strategies';
+export * from './lib/tokens';
+export * from './lib/utils';
+export * from './lib/validators';
+export * from './lib/interceptors';
+export * from './lib/clients';
 ```
 
 ## ABP.Root Configuration Options

@@ -10,6 +10,8 @@ The `module` startup template produces a distributable ABP module — a self-con
 
 ```csharp
 // framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/ProjectBuilding/Templates/MvcModule/ModuleTemplate.cs
+namespace Volo.Abp.Cli.ProjectBuilding.Templates.MvcModule;
+
 public class ModuleTemplate : ModuleTemplateBase
 {
     public const string TemplateName = "module";
@@ -30,7 +32,7 @@ The template ZIP is organised under `templates/module/aspnet-core/` with three t
 
 ### Source packages (`src/`)
 
-These are the projects that get published to NuGet and consumed by host applications.
+These are the projects that get published to NuGet and consumed by host applications. The following projects are present in `templates/module/aspnet-core/src/`:
 
 <CardGroup cols={2}>
   <Card title="Domain.Shared" icon="share-nodes">

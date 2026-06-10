@@ -10,7 +10,7 @@ ABP's localization system extends ASP.NET Core's `IStringLocalizer` stack with r
 
 <CardGroup cols={2}>
   <Card title="LocalizationResource" icon="book">
-    A named container for contributors and base resources. Constructed from a marker type class decorated with `[LocalizationResourceName]`.
+    A named container for contributors and base resources. Constructed from a marker type class decorated with `[LocalizationResourceName]`. Inherits from `LocalizationResourceBase`.
   </Card>
   <Card title="ILocalizationResourceContributor" icon="puzzle-piece">
     Supplies a `LocalizedString?` for a given culture and key. Multiple contributors per resource are merged in order — later contributors override earlier ones.
@@ -272,7 +272,7 @@ private StringLocalizerCacheItem CreateStringLocalizerCacheItem(
     foreach (var contributor in resource.Contributors)
         contributor.Initialize(context);
 
-    // Build base localizers recursively
+    // Build base localizers recursively (lockCache: false to avoid deadlock)
     return new StringLocalizerCacheItem(
         new AbpDictionaryBasedStringLocalizer(
             resource,
@@ -414,6 +414,10 @@ public static class LocalizationSettingNames
 ```
 
 ABP reads this setting (via `ISettingProvider`) to determine the user's preferred UI language, allowing per-user language selection persisted alongside other settings. The `LocalizationSettingProvider` class defines this setting so it integrates with the settings system.
+
+## External Localization Store
+
+`AbpStringLocalizerFactory` also consults `IExternalLocalizationStore` when looking up resources by name. This enables localization resources defined outside the application assembly (e.g., loaded from a plugin or remote endpoint) to participate in the same resolution pipeline without being registered in `AbpLocalizationOptions.Resources` at compile time.
 
 ## Module Registration Pattern
 

@@ -26,6 +26,53 @@ public interface ITemplateRenderer
 
 The `globalContext` allows injecting shared objects (e.g., a base URL or a localization helper) that are accessible throughout the template and any layout it references. If `cultureName` is `null`, `CultureInfo.CurrentUICulture` is used.
 
+The concrete implementation, `AbpTemplateRenderer`, resolves the template definition, looks up the `RenderEngine` name in `AbpTextTemplatingOptions.RenderingEngines`, creates a DI scope, and delegates to the matching `ITemplateRenderingEngine`:
+
+```csharp
+public class AbpTemplateRenderer : ITemplateRenderer, ITransientDependency
+{
+    public virtual async Task<string> RenderAsync(
+        string templateName, object? model = null,
+        string? cultureName = null,
+        Dictionary<string, object>? globalContext = null)
+    {
+        var templateDefinition = await TemplateDefinitionManager.GetAsync(templateName);
+        var renderEngine = templateDefinition.RenderEngine
+            ?? Options.DefaultRenderingEngine;
+
+        var providerType = Options.RenderingEngines.GetOrDefault(renderEngine!);
+
+        using (var scope = ServiceScopeFactory.CreateScope())
+        {
+            var engine = (ITemplateRenderingEngine)
+                scope.ServiceProvider.GetRequiredService(providerType);
+            return await engine.RenderAsync(templateName, model, cultureName, globalContext);
+        }
+    }
+}
+```
+
+### ITemplateRenderingEngine
+
+`ITemplateRenderingEngine` is the contract all rendering engines implement:
+
+```csharp
+public interface ITemplateRenderingEngine
+{
+    string Name { get; }
+    bool IsSandboxed { get; }
+
+    Task<string> RenderAsync(
+        string templateName,
+        object? model = null,
+        string? cultureName = null,
+        Dictionary<string, object>? globalContext = null
+    );
+}
+```
+
+Engines are registered in `AbpTextTemplatingOptions.RenderingEngines` as a `Dictionary<string, Type>` mapping engine name → implementation type.
+
 ### ITemplateContentProvider
 
 `ITemplateContentProvider` resolves the raw template string for a given template definition and culture:
@@ -49,7 +96,7 @@ public interface ITemplateContentProvider
 }
 ```
 
-`tryDefaults = true` tells the provider to fall back to the `DefaultCultureName` or the neutral template if the requested culture's content is unavailable. Content can come from Virtual File System, database, or any custom `ITemplateContentContributor`.
+`tryDefaults = true` tells the provider to fall back to the `DefaultCultureName` or the neutral template if the requested culture's content is unavailable. Content can come from the Virtual File System, database, or any custom `ITemplateContentContributor` registered in `AbpTextTemplatingOptions.ContentContributors`.
 
 ### ITemplateDefinitionManager
 
@@ -73,16 +120,40 @@ public interface ITemplateDefinitionManager
 ```csharp
 public class TemplateDefinition : IHasNameWithLocalizableDisplayName
 {
-    public string Name { get; }                     // max 128 chars
+    public const int MaxNameLength = 128;
+
+    public string Name { get; }                      // max 128 chars
     public ILocalizableString DisplayName { get; set; }
-    public bool IsLayout { get; }                   // true = layout template
-    public string? Layout { get; set; }             // layout template name
+    public bool IsLayout { get; }                    // true = layout template
+    public string? Layout { get; set; }              // layout template name
     public string? LocalizationResourceName { get; set; }
     public bool IsInlineLocalized { get; set; }
     public string? DefaultCultureName { get; }
-    public string? RenderEngine { get; set; }       // e.g., "Scriban"
+    public string? RenderEngine { get; set; }        // e.g., "Scriban"
     public Dictionary<string, object?> Properties { get; }
 }
+```
+
+Two constructor overloads exist. The first accepts a `Type localizationResource` parameter and extracts the resource name via `LocalizationResourceNameAttribute.GetName`. The second accepts a raw `string? localizationResourceName`:
+
+```csharp
+// Overload 1 – takes a Type
+public TemplateDefinition(
+    string name,
+    Type localizationResource,
+    ILocalizableString? displayName = null,
+    bool isLayout = false,
+    string? layout = null,
+    string? defaultCultureName = null)
+
+// Overload 2 – takes a string name
+public TemplateDefinition(
+    string name,
+    string? localizationResourceName = null,
+    ILocalizableString? displayName = null,
+    bool isLayout = false,
+    string? layout = null,
+    string? defaultCultureName = null)
 ```
 
 Fluent builders simplify setup:
@@ -91,13 +162,31 @@ Fluent builders simplify setup:
 new TemplateDefinition(
     name: "WelcomeEmail",
     localizationResource: typeof(MyLocalizationResource),
-    isLayout: false,
     layout: "EmailLayout",
     defaultCultureName: "en"
 ).WithRenderEngine(ScribanTemplateRenderingEngine.EngineName);
 ```
 
-`WithProperty(key, value)` stores arbitrary metadata that provider-specific code can read. `WithRenderEngine` sets `RenderEngine`, which `ITemplateRenderer` uses to dispatch to the correct rendering engine.
+`WithProperty(key, value)` stores arbitrary metadata that provider-specific code can read. `WithRenderEngine` sets `RenderEngine`, which `AbpTemplateRenderer` uses to dispatch to the correct rendering engine.
+
+---
+
+## AbpTextTemplatingOptions
+
+`AbpTextTemplatingOptions` is the central configuration class for the templating system:
+
+```csharp
+public class AbpTextTemplatingOptions
+{
+    public ITypeList<ITemplateDefinitionProvider> DefinitionProviders { get; }
+    public ITypeList<ITemplateContentContributor> ContentContributors { get; }
+    public IDictionary<string, Type> RenderingEngines { get; }
+    public string? DefaultRenderingEngine { get; set; }
+    public HashSet<string> DeletedTemplates { get; }
+}
+```
+
+`DefinitionProviders` is populated by implementations of `ITemplateDefinitionProvider`. `ContentContributors` are tried in order to locate template content. `RenderingEngines` maps engine names (e.g., `"Scriban"`) to their `ITemplateRenderingEngine` implementation types.
 
 ---
 
@@ -114,7 +203,7 @@ public interface ITemplateDefinitionProvider
 }
 ```
 
-The three-phase lifecycle (Pre → Define → Post) allows modules to define templates and then allows other modules to customize or extend them in `PostDefine`. ABP discovers all `ITemplateDefinitionProvider` implementations via DI during module initialization.
+The three-phase lifecycle (Pre → Define → Post) allows modules to define templates and then allows other modules to customize or extend them in `PostDefine`. ABP discovers all `ITemplateDefinitionProvider` implementations via the `AbpTextTemplatingOptions.DefinitionProviders` type list during module initialization.
 
 ---
 
@@ -133,7 +222,7 @@ public class ScribanTemplateRenderingEngine : TemplateRenderingEngineBase, ITran
 }
 ```
 
-The `IsSandboxed = true` means only public properties (not methods) on injected objects are accessible from templates, enforced via the `MemberFilter`:
+`IsSandboxed = true` means only public properties (not methods) on injected objects are accessible from templates, enforced via the `MemberFilter`:
 
 ```csharp
 protected virtual bool IsMemberAllowed(MemberInfo member)
@@ -149,7 +238,7 @@ protected virtual bool IsMemberAllowed(MemberInfo member)
     `TemplateDefinitionManager.GetAsync(templateName)` retrieves the `TemplateDefinition`, including layout name and render engine hint.
   </Step>
   <Step title="Fetch raw content">
-    `GetContentOrNullAsync(templateDefinition)` calls `ITemplateContentProvider` with the current culture. Falls back to `DefaultCultureName` if the culture-specific content is absent.
+    `GetContentOrNullAsync(templateDefinition)` (from `TemplateRenderingEngineBase`) calls `ITemplateContentProvider` with the current culture. Falls back to `DefaultCultureName` if the culture-specific content is absent.
   </Step>
   <Step title="Build Scriban context">
     A `TemplateContext` is constructed with a `ScriptObject` populated from `globalContext` and the `model` (accessible in templates as `{{ model.PropertyName }}`). If `LocalizationResourceName` is set, a `ScribanTemplateLocalizer` is injected as `L`.
@@ -220,8 +309,8 @@ ABP's emailing infrastructure renders email bodies through the text templating s
 // In your ITemplateDefinitionProvider.Define():
 context.Add(
     new TemplateDefinition(
-        "PasswordResetEmail",
-        typeof(MyLocalizationResource),
+        name: "PasswordResetEmail",
+        localizationResource: typeof(MyLocalizationResource),
         layout: "EmailLayout"
     ).WithRenderEngine(ScribanTemplateRenderingEngine.EngineName)
 );
@@ -252,17 +341,18 @@ public class PasswordResetEmailSender
 
 ```mermaid
 flowchart TD
-    APP[Application Code] -->|RenderAsync| TR[ITemplateRenderer]
+    APP[Application Code] -->|RenderAsync| TR[AbpTemplateRenderer]
     TR --> TDM[ITemplateDefinitionManager]
-    TDM --> TDP[ITemplateDefinitionProvider\nregistrations]
-    TR --> TCP[ITemplateContentProvider]
-    TCP --> VFS[Virtual File System\ncontent store]
-    TCP --> DB[Database\ncontent store]
-    TR -->|EngineName lookup| SE[ScribanTemplateRenderingEngine]
-    TR -->|EngineName lookup| RE[RazorTemplateRenderingEngine]
+    TDM --> OPT[AbpTextTemplatingOptions\n.DefinitionProviders]
+    TR -->|engine name lookup| SE[ScribanTemplateRenderingEngine]
+    TR -->|engine name lookup| RE[RazorTemplateRenderingEngine]
+    SE --> TCP[ITemplateContentProvider]
+    TCP --> CC[ITemplateContentContributor chain]
+    CC --> VFS[Virtual File System]
+    CC --> DB[Database store]
     SE --> SCRIBAN[Scriban.Template.Parse\n+ RenderAsync]
     SE --> LOC[ScribanTemplateLocalizer\nL variable]
-    SE -->|Layout defined| TR
+    SE -->|Layout defined| SE
 ```
 
 <Note>

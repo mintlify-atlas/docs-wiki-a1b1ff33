@@ -215,25 +215,59 @@ public enum ActionType
 
 ## AbpCrudPageBase
 
-The most important base class for admin CRUD pages:
+The most important base class for admin CRUD pages. Several overloads exist with progressively more type parameters; the most complete form is:
 
 ```csharp
 public abstract class AbpCrudPageBase<
     TAppService,
-    TEntityDto,
+    TGetOutputDto,
+    TGetListOutputDto,
     TKey,
     TGetListInput,
     TCreateInput,
-    TUpdateInput> : AbpComponentBase
+    TUpdateInput,
+    TListViewModel,
+    TCreateViewModel,
+    TUpdateViewModel> : AbpComponentBase
+    where TAppService : ICrudAppService<
+        TGetOutputDto, TGetListOutputDto, TKey,
+        TGetListInput, TCreateInput, TUpdateInput>
+    where TGetOutputDto : IEntityDto<TKey>
+    where TGetListOutputDto : IEntityDto<TKey>
 ```
 
-It provides:
-- `Entities` list and paging (`TotalCount`, `CurrentPage`, `PageSize`)
-- `CreateModal` / `EditModal` `Modal` references
-- `GetEntitiesAsync()`, `CreateEntityAsync()`, `UpdateEntityAsync()`, `DeleteEntityAsync()`
-- `OpenCreateModalAsync()`, `OpenEditModalAsync(TEntityDto entity)`
-- Authorization checks (`HasCreatePermission`, `HasUpdatePermission`, `HasDeletePermission`)
-- `ObjectExtensionMappingHelper` for handling extra properties
+Convenience overloads (3-, 4-, 5-, and 6-parameter variants) collapse the separate `GetOutput`/`GetListOutput`/`ViewModel` type parameters when they share the same DTO type.
+
+Key members provided by the base class:
+
+```csharp
+// Paging state
+protected virtual int PageSize { get; }   // Default: LimitedResultRequestDto.DefaultMaxResultCount
+protected int CurrentPage;
+protected int? TotalCount;
+protected IReadOnlyList<TListViewModel> Entities;
+
+// Modal references (bound to @ref in Razor)
+protected Modal? CreateModal;
+protected Modal? EditModal;
+
+// Permission flags (populated by SetPermissionsAsync)
+public bool HasCreatePermission { get; set; }
+public bool HasUpdatePermission { get; set; }
+public bool HasDeletePermission { get; set; }
+
+// Core lifecycle methods
+protected virtual Task GetEntitiesAsync();
+protected virtual Task OpenCreateModalAsync();
+protected virtual Task OpenEditModalAsync(TListViewModel entity);
+protected virtual Task CreateEntityAsync();
+protected virtual Task UpdateEntityAsync();
+protected virtual Task DeleteEntityAsync(TListViewModel entity);
+
+// Navigation / search
+protected virtual Task SearchEntitiesAsync();
+protected virtual Task OnDataGridReadAsync(DataGridReadDataEventArgs<TListViewModel> e);
+```
 
 ## MudBlazor Integration
 

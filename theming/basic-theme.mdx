@@ -246,15 +246,18 @@ public class BasicTheme : ITheme, ITransientDependency
     {
         switch (name)
         {
-            case StandardLayouts.Application: return typeof(MainLayout);
-            case StandardLayouts.Account:     return typeof(MainLayout);  // or AccountLayout
-            case StandardLayouts.Empty:       return typeof(NullLayout);
+            case StandardLayouts.Application:
+            case StandardLayouts.Account:
+            case StandardLayouts.Empty:
+                return typeof(MainLayout);
             default:
-                return fallbackToDefault ? typeof(MainLayout) : null;
+                return fallbackToDefault ? typeof(MainLayout) : typeof(NullLayout);
         }
     }
 }
 ```
+
+Note that the Blazor Basic Theme returns `MainLayout` for all three standard layout names — there is no separate account or empty layout component; the same `MainLayout` is used universally. Unknown layout names fall back to `MainLayout` when `fallbackToDefault = true`, or return `NullLayout` (the no-chrome layout) otherwise.
 
 The `DynamicLayoutComponent` (from `@abp/ng.core` equivalent in Blazor: `Volo.Abp.AspNetCore.Components.Web.Theming`) uses `ITheme.GetLayout(name)` to dynamically set `@layout` at runtime.
 

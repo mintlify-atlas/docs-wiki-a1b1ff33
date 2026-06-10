@@ -120,9 +120,15 @@ protected async override Task<List<BundleFile>> GetBundleFilesAsync(
 {
     return RequestResources.TryAdd(await base.GetBundleFilesAsync(contributors));
 }
+
+protected async override Task<List<BundleFile>> GetDynamicResourcesAsync(
+    List<IBundleContributor> contributors)
+{
+    return RequestResources.TryAdd(await base.GetDynamicResourcesAsync(contributors));
+}
 ```
 
-`IWebRequestResources` is a request-scoped service that deduplicates resource URLs across multiple bundle tag helpers on the same page. If `abp-script-bundle` and `abp-style-bundle` both try to add the same file (via base bundle inheritance), `TryAdd` ensures it appears only once.
+`IWebRequestResources` is a request-scoped service that deduplicates resource URLs across multiple bundle tag helpers on the same page. Both static bundle files and dynamic resources (resolved at request time via `ConfigureDynamicResourcesAsync`) are filtered through `TryAdd` — if `abp-script-bundle` and `abp-style-bundle` both try to add the same file (via base bundle inheritance), it appears only once in the rendered output.
 
 ### Bundle File Generation
 

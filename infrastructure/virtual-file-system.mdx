@@ -26,11 +26,13 @@ Any code that accepts `IFileProvider` (Razor views, `.resx` discovery, localizat
 public class VirtualFileProvider : IVirtualFileProvider, ISingletonDependency
 {
     private readonly IFileProvider _hybridFileProvider;
+    private readonly AbpVirtualFileSystemOptions _options;
 
     public VirtualFileProvider(
         IOptions<AbpVirtualFileSystemOptions> options,
         IDynamicFileProvider dynamicFileProvider)
     {
+        _options = options.Value;
         _hybridFileProvider = CreateHybridProvider(dynamicFileProvider);
     }
 
@@ -55,11 +57,13 @@ Resolution priority (highest to lowest):
 2. Last registered `VirtualFileSetInfo` — typically the host application's physical files
 3. Earlier registrations — framework and module embedded resources
 
+The provider also exposes `GetDirectoryContents` (normalizing empty `subpath` to `"/"`) and `Watch`, both delegating to `_hybridFileProvider`.
+
 ---
 
 ## AbpVirtualFileSystemOptions and VirtualFileSetList
 
-`AbpVirtualFileSystemOptions` holds a `VirtualFileSetList` (a `List<VirtualFileSetInfo>`):
+`AbpVirtualFileSystemOptions` holds a `VirtualFileSetList` (a `List<VirtualFileSetInfo>` subclass):
 
 ```csharp
 public class AbpVirtualFileSystemOptions
@@ -70,13 +74,24 @@ public class AbpVirtualFileSystemOptions
 public class VirtualFileSetList : List<VirtualFileSetInfo> { }
 ```
 
-Each `VirtualFileSetInfo` wraps an `IFileProvider`. The host application's physical files are typically added last via `AddEmbedded<T>()` extension calls on the options.
+Each `VirtualFileSetInfo` wraps an `IFileProvider`:
+
+```csharp
+public class VirtualFileSetInfo
+{
+    public IFileProvider FileProvider { get; }
+}
+```
+
+Two specialised subclasses exist:
+- `EmbeddedVirtualFileSetInfo` — carries the `Assembly` and an optional `BaseFolder`
+- `PhysicalVirtualFileSetInfo` — carries the physical root directory path
 
 ---
 
 ## Embedding Resources: EmbeddedVirtualFileSetInfo
 
-`EmbeddedVirtualFileSetInfo` carries the assembly reference and an optional base folder, linking the embedded resource manifest to a virtual path:
+`EmbeddedVirtualFileSetInfo` (in `Volo.Abp.VirtualFileSystem.Embedded`) links the embedded resource manifest to a virtual path:
 
 ```csharp
 public class EmbeddedVirtualFileSetInfo : VirtualFileSetInfo
@@ -96,7 +111,7 @@ public class EmbeddedVirtualFileSetInfo : VirtualFileSetInfo
 }
 ```
 
-Calling `options.FileSets.AddEmbedded<MyModule>()` in a module's `ConfigureServices` creates one of these entries backed by an `AbpEmbeddedFileProvider`.
+Calling `options.FileSets.AddEmbedded<MyModule>(baseFolder: "wwwroot")` in a module's `ConfigureServices` creates one of these entries. When `GenerateEmbeddedFilesManifest` is enabled in the `.csproj`, `VirtualFileSetListExtensions.AddEmbedded` uses `ManifestEmbeddedFileProvider`; otherwise it falls back to `AbpEmbeddedFileProvider`.
 
 ---
 
@@ -104,7 +119,7 @@ Calling `options.FileSets.AddEmbedded<MyModule>()` in a module's `ConfigureServi
 
 `AbpEmbeddedFileProvider` reads the assembly's embedded resource manifest on first access (using `Lazy<Dictionary<string, IFileInfo>>`). It converts .NET manifest resource paths (e.g., `MyModule.Pages.Index.cshtml`) to virtual paths (e.g., `/Pages/Index.cshtml`) by:
 
-1. Stripping the `BaseNamespace` prefix
+1. Stripping the `BaseNamespace` prefix (and the following `.`)
 2. Splitting on `.` and treating the last two segments as `filename.extension`
 3. Joining the remaining segments with `/` as directory parts
 
@@ -125,14 +140,28 @@ private string ConvertToRelativePath(string resourceName)
 ```
 
 <Note>
-This path reconstruction assumes filenames contain exactly one dot (the extension). Files with multiple dots in the name (e.g., `my.file.js`) require a `[EmbeddedResourcePrefix]` or manual namespace adjustment to avoid incorrect path splitting.
+This path reconstruction assumes filenames contain exactly one dot (the extension). Files with multiple dots in the name (e.g., `my.file.js`) require a `baseNamespace` or `baseFolder` argument to `AddEmbedded` to avoid incorrect path splitting.
 </Note>
 
 Directories are synthesised recursively — if `/Pages/Account/Login.cshtml` is found, `AbpEmbeddedFileProvider` also creates virtual directory entries for `/Pages/Account` and `/Pages`.
 
 ### Last-Modified Time
 
-To enable caching correctness, the provider reads `File.GetLastWriteTimeUtc(Assembly.Location)` as the last-modified time for all resources in that assembly. This means touching the DLL invalidates all virtual file cache entries for that module.
+To enable caching correctness, the provider reads `File.GetLastWriteTimeUtc(Assembly.Location)` as the last-modified time for all resources in that assembly (with a `DateTimeOffset.UtcNow` fallback when the path is unavailable). This means touching the DLL invalidates all virtual file cache entries for that module.
+
+---
+
+## VirtualFileSetListExtensions
+
+`VirtualFileSetListExtensions` provides the fluent API for populating `VirtualFileSetList`:
+
+| Method | Description |
+|---|---|
+| `AddEmbedded<T>(baseNamespace?, baseFolder?)` | Embeds resources from `typeof(T).Assembly`. Uses `ManifestEmbeddedFileProvider` when a manifest XML exists, otherwise `AbpEmbeddedFileProvider`. |
+| `AddPhysical(root, exclusionFilters?)` | Adds a `PhysicalFileProvider` backed by the given directory path. |
+| `ReplaceEmbeddedByPhysical<T>(physicalPath)` | Finds the `EmbeddedVirtualFileSetInfo` whose `Assembly` matches `typeof(T)` and replaces it in-place with a `PhysicalVirtualFileSetInfo`. Respects `BaseFolder` by appending it to `physicalPath`. |
+
+`ReplaceEmbeddedByPhysical` modifies the existing list entry (does not append), so the position in the composite is preserved.
 
 ---
 
@@ -158,9 +187,7 @@ Call `AddOrUpdate` with any `IFileInfo` implementation to make a file immediatel
 
 ## Development-Time Physical File Override
 
-During development you often want to edit a module's views in-place rather than rebuilding the assembly. ABP supports this by registering a `PhysicalFileProvider` pointing at the module's source directory **on top of** the embedded files.
-
-Call `ReplaceEmbeddedByPhysical<TModule>` to override an embedded set with a physical directory:
+During development you often want to edit a module's views in-place rather than rebuilding the assembly. ABP supports this by replacing an embedded set with a `PhysicalFileProvider` pointing at the module's source directory.
 
 ```csharp
 // In the host application's ConfigureServices (development only)
@@ -173,7 +200,7 @@ Configure<AbpVirtualFileSystemOptions>(options =>
 });
 ```
 
-Because `FileSets` are resolved in reverse order, the physical provider appended last takes precedence, shadowing the embedded entries.
+Because `ReplaceEmbeddedByPhysical` replaces the list entry in-place, the priority ordering of all other sets is unchanged. The physical provider simply shadows the embedded entries for that assembly.
 
 ---
 
@@ -182,8 +209,8 @@ Because `FileSets` are resolved in reverse order, the physical provider appended
 Framework modules embed their views, JS, and CSS into the DLL by:
 
 1. Setting `<EmbeddedResource Include="**\*.cshtml" />` (or `js`, `css`) in the `.csproj`
-2. Calling `options.FileSets.AddEmbedded<TModule>()` in `ConfigureServices`
-3. Tagging view files with `<GenerateEmbeddedFilesManifest>true</GenerateEmbeddedFilesManifest>` to produce the manifest used by `EmbeddedFileProvider`
+2. Optionally setting `<GenerateEmbeddedFilesManifest>true</GenerateEmbeddedFilesManifest>` to produce the manifest used by `ManifestEmbeddedFileProvider`
+3. Calling `options.FileSets.AddEmbedded<TModule>()` in `ConfigureServices`
 
 ```csharp
 // In a module's ConfigureServices:
@@ -195,6 +222,8 @@ public override void ConfigureServices(ServiceConfigurationContext context)
     });
 }
 ```
+
+When `GenerateEmbeddedFilesManifest` is enabled (recommended), the manifest preserves exact file names including multiple dots. Without it, `AbpEmbeddedFileProvider` is used and the dot-based path reconstruction applies.
 
 ---
 

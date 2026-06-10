@@ -17,7 +17,7 @@ public interface IDomainService : ITransientDependency
 
 That is the entire interface. Its only job is to be a recognisable marker that:
 
-1. Causes the ABP conventional registrar to register implementing classes in the DI container with **transient** lifetime.
+1. Causes the ABP conventional registrar to register implementing classes in the DI container with **transient** lifetime (because `ITransientDependency` is extended).
 2. Signals to readers that a class belongs to the domain layer, not the application or infrastructure layer.
 
 Because `IDomainService` extends `ITransientDependency`, any class that implements it is automatically discovered and registered — no `[Dependency]` attribute needed.
@@ -27,9 +27,13 @@ Because `IDomainService` extends `ITransientDependency`, any class that implemen
 Most domain services inherit from `DomainService` rather than implementing `IDomainService` directly:
 
 ```csharp
+// Volo.Abp.Domain.Services
 public abstract class DomainService : IDomainService
 {
     public IAbpLazyServiceProvider LazyServiceProvider { get; set; } = default!;
+
+    [Obsolete("Use LazyServiceProvider instead.")]
+    public IServiceProvider ServiceProvider { get; set; } = default!;
 
     protected IClock Clock
         => LazyServiceProvider.LazyGetRequiredService<IClock>();
@@ -235,6 +239,19 @@ A domain service is a DI-managed, transient object. It is different from a stati
 1. It can depend on infrastructure services (`IRepository`, `IClock`, `IGuidGenerator`) through the DI container — static helpers cannot.
 2. It participates in the ABP interception pipeline: Unit of Work, auditing, and change-tracking interceptors apply to its methods the same way they apply to application service methods.
 
+## Domain service vs. application service: responsibility matrix
+
+| Concern | Domain service | Application service |
+|---|---|---|
+| Business rule enforcement | ✅ | ❌ (delegate to domain) |
+| Repository calls | ✅ | ✅ (read queries) |
+| Domain event raising | ✅ | ❌ |
+| DTO mapping | ❌ | ✅ |
+| Authorization checks | ❌ | ✅ |
+| HTTP / API awareness | ❌ | ✅ |
+| Calls other domain services | ✅ | ✅ |
+| Calls application services | ❌ | ✅ |
+
 <Tip>
-Keep domain services focused. A class that starts growing to 1 000+ lines usually signals that you need to split it into smaller services — one per distinct subdomain concept. `OrderManager`, `PaymentManager`, and `ShipmentManager` are better than one giant `EcommerceManager`.
+Keep domain services focused. A class that starts growing to 1,000+ lines usually signals that you need to split it into smaller services — one per distinct subdomain concept. `OrderManager`, `PaymentManager`, and `ShipmentManager` are better than one giant `EcommerceManager`.
 </Tip>

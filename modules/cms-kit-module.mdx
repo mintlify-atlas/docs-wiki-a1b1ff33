@@ -73,14 +73,23 @@ public class Blog : FullAuditedAggregateRoot<Guid>, IMultiTenant
 public class BlogPost : FullAuditedAggregateRoot<Guid>, IMultiTenant, IHasEntityVersion
 {
     public virtual Guid BlogId { get; protected set; }
+
+    [NotNull]
     public virtual string Title { get; protected set; }
+
+    [NotNull]
     public virtual string Slug { get; protected set; }
+
+    // ShortDescription is optional (can be null)
     public virtual string ShortDescription { get; protected set; }
+
     public virtual string Content { get; protected set; }
     public virtual Guid? CoverImageMediaId { get; set; }
-    public virtual Guid AuthorId { get; set; }
+    public virtual Guid? TenantId { get; protected set; }
+    public Guid AuthorId { get; set; }
     public virtual CmsUser Author { get; set; }
     public virtual BlogPostStatus Status { get; set; }  // Draft|WaitingForReview|Published
+    public virtual int EntityVersion { get; protected set; }
 }
 ```
 
@@ -91,17 +100,22 @@ public class BlogPost : FullAuditedAggregateRoot<Guid>, IMultiTenant, IHasEntity
 `Comment` supports threaded discussions attached to any entity type (not just blog posts) via the `EntityType` + `EntityId` polymorphic reference:
 
 ```csharp
-// From domain source
-public class Comment : FullAuditedAggregateRoot<Guid>, IMultiTenant
+public class Comment : AggregateRoot<Guid>, IHasCreationTime, IMustHaveCreator, IMultiTenant
 {
+    public virtual Guid? TenantId { get; protected set; }
     public virtual string EntityType { get; protected set; }  // e.g. "BlogPost"
     public virtual string EntityId { get; protected set; }    // target entity id as string
     public virtual string Text { get; protected set; }
     public virtual Guid? RepliedCommentId { get; protected set; }
     public virtual Guid CreatorId { get; set; }
-    public virtual Guid? TenantId { get; protected set; }
+    public virtual DateTime CreationTime { get; set; }
+    public virtual string Url { get; set; }                   // optional external URL
+    public virtual string IdempotencyToken { get; set; }      // duplicate-submission guard
+    public virtual bool? IsApproved { get; private set; }     // null=pending, true=approved, false=rejected
 }
 ```
+
+`Comment` uses `Approve()`, `Reject()`, and `WaitForApproval()` methods to transition the `IsApproved` state. This supports comment moderation workflows.
 
 `ICommentEntityTypeDefinitionStore` maintains a whitelist of entity types that are allowed to have comments. The default implementation reads from `CmsKitCommentOptions.EntityTypes` which modules register into.
 

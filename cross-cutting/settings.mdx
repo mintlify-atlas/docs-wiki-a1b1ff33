@@ -31,6 +31,8 @@ A `SettingDefinition` is the schema declaration for one setting. It is registere
 public class SettingDefinition
 {
     public string Name { get; }
+    public ILocalizableString DisplayName { get; set; }
+    public ILocalizableString? Description { get; set; }
     public string? DefaultValue { get; set; }
     public bool IsVisibleToClients { get; set; }   // default: false
     public bool IsInherited { get; set; }           // default: true
@@ -47,6 +49,7 @@ Key points:
 - **`Providers`** — when non-empty, only providers whose `Name` is in this list are consulted during resolution. Use `WithProviders("G", "T")` to restrict a setting to global/tenant scope only.
 - **`IsEncrypted`** — if `true`, the raw bytes stored in `ISettingStore` are encrypted. `SettingProvider` calls `ISettingEncryptionService.Decrypt` after retrieval.
 - **`IsVisibleToClients`** — controls whether the setting is exposed to the UI/API layer. Sensitive settings (passwords, API keys) should leave this as `false`.
+- **`IsInherited`** — when `true` (the default), a setting value can be inherited from a higher scope if no lower-scope override exists. Note: full multi-scope inheritance depends on the provider implementations.
 
 ### Registering Definitions
 
@@ -168,7 +171,7 @@ public virtual async Task<string?> GetOrNullAsync(string name)
 public class SettingValueProviderManager : ISettingValueProviderManager, ISingletonDependency
 {
     public List<ISettingValueProvider> Providers => _lazyProviders.Value;
-    // ...
+    // ...\
     protected virtual List<ISettingValueProvider> GetProviders()
     {
         var providers = Options.ValueProviders

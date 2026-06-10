@@ -13,10 +13,10 @@ The Audit Logging module provides the persistence layer for ABP's auditing syste
     `Volo.Abp.AuditLogging.Domain.Shared` — `AuditLogConsts`, `EntityChangeConsts`, `EntityPropertyChangeConsts`, error codes, localization resources
   </Card>
   <Card title="Domain" icon="cube">
-    `Volo.Abp.AuditLogging.Domain` — `AuditLog`, `EntityChange`, `EntityPropertyChange`, `AuditLogAction` entities; `IAuditLogRepository`, `AuditingStore`, `AuditLogInfoToAuditLogConverter`, `IAuditLogExcelFileRepository`
+    `Volo.Abp.AuditLogging.Domain` — `AuditLog`, `EntityChange`, `EntityPropertyChange`, `AuditLogAction` entities; `IAuditLogRepository`, `AuditingStore`, `AuditLogInfoToAuditLogConverter`
   </Card>
   <Card title="EntityFrameworkCore" icon="database">
-    `Volo.Abp.AuditLogging.EntityFrameworkCore` — `AbpAuditLoggingDbContext`, EF Core `IAuditLogRepository` and `IAuditLogExcelFileRepository` implementations, migration history table configuration
+    `Volo.Abp.AuditLogging.EntityFrameworkCore` — `AbpAuditLoggingDbContext`, EF Core `IAuditLogRepository` implementation, migration history table configuration
   </Card>
   <Card title="MongoDB" icon="database">
     `Volo.Abp.AuditLogging.MongoDB` — MongoDB collection mapping, `IAuditLogRepository` with filter/sort expressions for the same rich query surface
@@ -45,14 +45,19 @@ public class AuditLog : AggregateRoot<Guid>, IMultiTenant
     public virtual Guid? ImpersonatorUserId { get; protected set; }
     public virtual string ImpersonatorUserName { get; protected set; }
     public virtual Guid? ImpersonatorTenantId { get; protected set; }
+    public virtual string ImpersonatorTenantName { get; protected set; }
     public virtual DateTime ExecutionTime { get; protected set; }
     public virtual int ExecutionDuration { get; protected set; }    // milliseconds
     public virtual string ClientIpAddress { get; protected set; }
+    public virtual string ClientName { get; protected set; }        // client application name
+    public virtual string ClientId { get; set; }                    // OAuth2 client_id
+    public virtual string CorrelationId { get; set; }
+    public virtual string BrowserInfo { get; protected set; }
     public virtual string HttpMethod { get; protected set; }
     public virtual string Url { get; protected set; }
     public virtual int? HttpStatusCode { get; set; }
-    public virtual string CorrelationId { get; set; }
     public virtual string Exceptions { get; protected set; }
+    public virtual string Comments { get; protected set; }
 
     // Owned collections
     public virtual ICollection<EntityChange> EntityChanges { get; protected set; }
@@ -60,7 +65,7 @@ public class AuditLog : AggregateRoot<Guid>, IMultiTenant
 }
 ```
 
-Field lengths are capped by constants in `AuditLogConsts` (e.g., `MaxUrlLength = 256`, `MaxUserNameLength = 256`, `MaxBrowserInfoLength = 512`) using `Truncate()` extensions in the constructor.
+Field lengths are capped by constants in `AuditLogConsts` (e.g., `MaxUrlLength`, `MaxUserNameLength`, `MaxBrowserInfoLength`, `MaxClientNameLength`, `MaxClientIdLength`, `MaxCommentsLength`) using `Truncate()` extensions in the constructor.
 
 ### AuditLogAction
 
@@ -131,7 +136,7 @@ public class AuditingStore : IAuditingStore, ITransientDependency
         try { await SaveLogAsync(auditInfo); }
         catch (Exception ex)
         {
-            Logger.LogWarning("Could not save the audit log object: " + auditInfo);
+            Logger.LogWarning("Could not save the audit log object: " + Environment.NewLine + auditInfo.ToString());
             Logger.LogException(ex, LogLevel.Error);
         }
     }
@@ -227,7 +232,7 @@ The `AbpAuditLoggingDbContext` configures:
 
 | Table | Key columns |
 |---|---|
-| `AbpAuditLogs` | `Id`, `TenantId`, `UserId`, `ExecutionTime`, `HttpStatusCode`, `Url`, `CorrelationId` |
+| `AbpAuditLogs` | `Id`, `TenantId`, `UserId`, `ExecutionTime`, `HttpStatusCode`, `Url`, `CorrelationId`, `ClientId` |
 | `AbpAuditLogActions` | `Id`, `AuditLogId`, `ServiceName`, `MethodName` |
 | `AbpEntityChanges` | `Id`, `AuditLogId`, `EntityTypeFullName`, `EntityId`, `ChangeType` |
 | `AbpEntityPropertyChanges` | `Id`, `EntityChangeId`, `PropertyName`, `OriginalValue`, `NewValue` |
